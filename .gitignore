@@ -1,0 +1,26 @@
+# Build artifacts
+/build/
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.o
+*.d
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Python (just in case)
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
