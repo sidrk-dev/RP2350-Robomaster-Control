@@ -64,6 +64,27 @@ Go to **Tools** > **Manage Libraries** and install the following:
 4. Select the Port: **Tools** > **Port**.
 5. Click **Upload** (Right arrow icon).
 
+## ⚙️ Code Configuration (Permanent Settings)
+
+To change default settings permanently, edit `goo.ino`:
+
+1.  **Pin Definitions**:
+    ```cpp
+    #define RX_PIN 4  // gpio4 (MISO)
+    #define CS_PIN 5  // gpio5 (CS)
+    #define SCK_PIN 6 // gpio6 (SCK)
+    #define TX_PIN 7  // gpio7 (MOSI)
+    ```
+2.  **Motor Count**:
+    ```cpp
+    #define MOTOR_NUM 8 // Change if using fewer motors
+    ```
+3.  **Default Gear Ratios and PID**:
+    Locate the `setMotorParam()` function.
+    -   Modify `motor[i].gearRatio` for M3508 (approx 19.0) or M2006 (36.0).
+    -   Modify default PID values in `motor[i].anglePid` and `motor[i].speedPid`.
+
+
 ## 🛠️ Usage (Serial Monitor)
 
 Open the **Serial Monitor** (Tools > Serial Monitor) and set the baud rate to **115200**. Ensure "Both NL & CR" or "Newline" is selected.
