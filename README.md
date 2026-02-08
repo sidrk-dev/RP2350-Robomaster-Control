@@ -33,6 +33,8 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 
 *Note: The MCP2515 INT pin is not currently used in this code.*
 
+> **⚠️ IMPORTANT**: The Raspberry Pi Pico, MCP2515, and the Motor Controller (ESC) power supply **MUST share a common ground**. Failing to connect the grounds will result in communication failure.
+
 ### CAN Bus Wiring
 - Connect generic CAN High and CAN Low from the MCP2515 to the CAN High and CAN Low on the motor ESCs.
 - Ensure the CAN bus is terminated with 120Ω resistors at both ends.
