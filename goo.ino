@@ -1,6 +1,6 @@
-#include "RPi_Pico_TimerInterrupt.h"
-#include "mcp2515.h"
 #include "motorControl.h"
+#include "src/RPI_PICO_TimerInterrupt/src/RPi_Pico_TimerInterrupt.h"
+#include "src/autowp-mcp2515/mcp2515.h"
 #include <SPI.h>
 #include <regex>
 

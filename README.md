@@ -51,11 +51,12 @@ Download and install the latest Arduino IDE from [arduino.cc](https://www.arduin
 4. Go to **Tools** > **Board** > **Boards Manager**.
 5. Search for "Pico" and install **"Raspberry Pi Pico/RP2040" by Earle F. Philhower, III**.
 
-### 3. Install Required Libraries
-Go to **Tools** > **Manage Libraries** and install the following:
-1. **`mcp2515`** by autowp (or verify which library is used if included locally).
-   *Note: If the project includes `mcp2515.h` locally, you may not need to install this separately, but `autowp-mcp2515` is standard.*
-2. **`RPi_Pico_TimerInterrupt`** by Khoi Hoang.
+### 3. Libraries
+All required libraries are included in the `src` folder. No manual library installation is required.
+
+- `autowp-mcp2515` (Modified for local include)
+- `RPi_Pico_TimerInterrupt` (Modified for local include)
+
 
 ### 4. Upload Code
 1. Open `goo.ino` in Arduino IDE.

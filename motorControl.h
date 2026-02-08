@@ -1,8 +1,9 @@
 #ifndef MOTOR_CONTROL_H
 #define MOTOR_CONTROL_H
 
+#include "src/autowp-mcp2515/mcp2515.h"
 #include <Arduino.h>
-#include <mcp2515.h>
+
 
 // C620 feedback frequency (125Hz as per datasheet)
 #define C620_FEEDBACK_125HZ 125.0f
