@@ -2,7 +2,7 @@
 
 Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico and MCP2515 CAN Bus module. This project provides a serial command interface to control position, speed, PID tuning, calibration, and homing.
 
-## 🚀 Features
+## Features
 
 - **Position Control**: Move motors to absolute angles (0-360 degrees).
 - **Speed Control**: Set continuous rotation speed (RPM).
@@ -12,7 +12,7 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - **Gear Ratios**: Configure external gear reductions.
 - **Multi-Motor Support**: Control up to 8 motors on a single CAN bus.
 
-## 📦 Hardware Setup
+## Hardware Setup
 
 ### Components
 - **Microcontroller**: Raspberry Pi Pico (RP2040)
@@ -38,7 +38,7 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - Ensure the CAN bus is terminated with 120Ω resistors at both ends.
 - **Motor IDs**: Set motor IDs (1-8) on the ESCs according to the DJI documentation (usually by pressing the button on the ESC).
 
-## 💻 Software Setup
+## Software Setup
 
 ### 1. Install Arduino IDE
 Download and install the latest Arduino IDE from [arduino.cc](https://www.arduino.cc/en/software).
@@ -65,7 +65,7 @@ All required libraries are included in the `src` folder. No manual library insta
 4. Select the Port: **Tools** > **Port**.
 5. Click **Upload** (Right arrow icon).
 
-## ⚙️ Code Configuration (Permanent Settings)
+## Code Configuration (Permanent Settings)
 
 To change default settings permanently, edit `goo.ino`:
 
@@ -86,7 +86,7 @@ To change default settings permanently, edit `goo.ino`:
     -   Modify default PID values in `motor[i].anglePid` and `motor[i].speedPid`.
 
 
-## 🛠️ Usage (Serial Monitor)
+## Usage (Serial Monitor)
 
 Open the **Serial Monitor** (Tools > Serial Monitor) and set the baud rate to **115200**. Ensure "Both NL & CR" or "Newline" is selected.
 
@@ -130,7 +130,7 @@ Configure automatic homing based on stall detection (current limit).
    `HOME <id>`
    *Example*: `HOME 1` (Motor 1 runs until it hits a hard stop, then sets position to 0).
 
-## 📄 Documentation
+## Documentation
 
 For more detailed guides, see the included markdown files:
 - [Homing Guide](HOMING_GUIDE.md)
