@@ -41,17 +41,6 @@ struct {
   bool sendMotor = false;
 } flag;
 
-// Homing state for each motor
-struct {
-  bool isHoming;
-  uint32_t startTime;
-  float lastAngle;
-  uint32_t lastMoveTime;
-  float homingSpeed;  // RPM for homing
-  float stallCurrent; // Current threshold for stall detection (Amps)
-  uint32_t stallTime; // Time motor must be stalled to confirm (ms)
-} homingState[MOTOR_NUM];
-
 struct can_frame sendMsg[2] = {};
 struct can_frame readMsg = {};
 
@@ -65,7 +54,6 @@ bool recvMotorFlag(struct repeating_timer *t);
 bool sendMotorFlag(struct repeating_timer *t);
 void printHelp();
 void handleSerial();
-void startHoming(uint8_t motorIndex, float speed, float currentThreshold);
 
 // -------------------- SETUP --------------------
 void setup() {
@@ -103,14 +91,6 @@ void setup() {
 #endif
   digitalWrite(CYTRON_DIR_PIN, LOW);
   analogWrite(CYTRON_PWM_PIN, 0);
-
-  // Initialize homing parameters with defaults
-  for (int i = 0; i < MOTOR_NUM; i++) {
-    homingState[i].isHoming = false;
-    homingState[i].homingSpeed = -5.0;  // -5 RPM (reverse)
-    homingState[i].stallCurrent = 1.75; // 1.75 A threshold
-    homingState[i].stallTime = 300;     // 300 ms confirmation
-  }
 
   printHelp();
 }
@@ -153,9 +133,6 @@ void loop() {
     recvMotor();
   if (flag.sendMotor)
     sendMotor();
-
-  // Update homing sequences
-  updateHoming();
 
   // Status LED: ON if any motor is in angle mode
   bool anyAngleMode = false;
@@ -202,17 +179,7 @@ void printHelp() {
   Serial.println("  Example: GEAR 1 5   (Motor 1 has 5:1 external gearing)");
   Serial.println("  Example: GEAR 2 1   (Motor 2 has no external gearing)");
   Serial.println("");
-  Serial.println("Homing (Physical Limit Detection):");
-  Serial.println(
-      "  HOME <id>              : Home Motor <id> to physical limit");
-  Serial.println(
-      "  HOMECFG <spd> <cur> <t> : Set homing parameters (all motors)");
-  Serial.println("    <spd> = Speed in RPM (negative = reverse)");
-  Serial.println("    <cur> = Stall current threshold in Amps");
-  Serial.println("    <t>   = Stall confirmation time in ms");
-  Serial.println("  Example: HOME 2        (Use current settings)");
-  Serial.println("  Example: HOMECFG -5 1.75 300  (Slower, more sensitive)");
-  Serial.println("");
+
   Serial.println("Cytron Motor Control (MD10C):");
   Serial.println(
       "  C <speed>              : Set Cytron motor speed (-255 to 255)");
@@ -283,7 +250,6 @@ void handleSerial() {
     for (int i = 0; i < MOTOR_NUM; i++) {
       motor[i].mode = MODE::SPEED;
       motor[i].target.speed = 0.0f;
-      homingState[i].isHoming = false; // Cancel any homing
     }
     digitalWrite(CYTRON_DIR_PIN, LOW);
     analogWrite(CYTRON_PWM_PIN, 0);
@@ -314,80 +280,6 @@ void handleSerial() {
     }
     Serial.print("Cytron Motor -> ");
     Serial.println(speed);
-    return;
-  }
-
-  // Command: SET HOMING CONFIGURATION
-  if (line.startsWith("HOMECFG ")) {
-    int sp1 = line.indexOf(' ');
-    int sp2 = line.indexOf(' ', sp1 + 1);
-    int sp3 = line.indexOf(' ', sp2 + 1);
-
-    if (sp1 == -1 || sp2 == -1 || sp3 == -1) {
-      Serial.println("Error: Use format 'HOMECFG <speed> <current> <time>'");
-      return;
-    }
-
-    float speed = line.substring(sp1 + 1, sp2).toFloat();
-    float current = line.substring(sp2 + 1, sp3).toFloat();
-    uint32_t time = line.substring(sp3 + 1).toInt();
-
-    if (current <= 0) {
-      Serial.println("Error: Current threshold must be positive");
-      return;
-    }
-
-    if (time < 100 || time > 5000) {
-      Serial.println("Error: Stall time must be 100-5000 ms");
-      return;
-    }
-
-    // Apply to all motors
-    for (int i = 0; i < MOTOR_NUM; i++) {
-      homingState[i].homingSpeed = speed;
-      homingState[i].stallCurrent = current;
-      homingState[i].stallTime = time;
-    }
-
-    Serial.println("Homing config updated:");
-    Serial.print("  Speed: ");
-    Serial.print(speed);
-    Serial.println(" RPM");
-    Serial.print("  Current threshold: ");
-    Serial.print(current);
-    Serial.println(" A");
-    Serial.print("  Stall time: ");
-    Serial.print(time);
-    Serial.println(" ms");
-    return;
-  }
-
-  // Command: HOME TO PHYSICAL LIMIT
-  if (line.startsWith("HOME ")) {
-    String idStr = line.substring(5);
-    int id = idStr.toInt();
-
-    if (id < 1 || id > MOTOR_NUM) {
-      Serial.print("Error: ID must be 1-");
-      Serial.println(MOTOR_NUM);
-      return;
-    }
-
-    int idx = id - 1;
-
-    Serial.print("Starting homing sequence for Motor ");
-    Serial.println(id);
-    Serial.print("Settings: ");
-    Serial.print(homingState[idx].homingSpeed);
-    Serial.print(" RPM, ");
-    Serial.print(homingState[idx].stallCurrent);
-    Serial.print(" A, ");
-    Serial.print(homingState[idx].stallTime);
-    Serial.println(" ms");
-
-    // Use stored parameters for this motor
-    startHoming(idx, homingState[idx].homingSpeed,
-                homingState[idx].stallCurrent);
     return;
   }
 

@@ -8,7 +8,6 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - **Speed Control**: Set continuous rotation speed (RPM).
 - **PID Tuning**: Adjust Angle and Speed PID gains on the fly.
 - **Calibration**: Set the current physical position to a specific angle.
-- **Homing**: Automatically find physical limits (e.g., endstops) using current sensing (stall detection).
 - **Gear Ratios**: Configure external gear reductions.
 - **Multi-Motor Support**: Control up to 8 motors on a single CAN bus.
 - **Brushed DC Support**: Integrated support for Cytron MD10C motor drivers.
@@ -128,21 +127,6 @@ Adjust the control loop behavior. Values are saved until restart.
 | `SP <id> <kp> <ki> <kd>` | Set **Speed** PID | `SP 1 2.0 0.1 0.0` |
 | `SHOW <id>` | Show current PID values | `SHOW 1` |
 
-### Homing (Endstop Detection)
-Configure automatic homing based on stall detection (current limit).
-
-1. **Configure Parameters** (Optional, applied to all motors):
-   `HOMECFG <speed> <current_threshold> <time_ms>`
-   - `speed`: Homing speed in RPM (negative for reverse). default: -5.0
-   - `current_threshold`: Current in Amps to trigger stall. default: 1.75A
-   - `time_ms`: Time in ms to hold stall before confirming. default: 300ms
-   
-   *Example*: `HOMECFG -10 2.5 500`
-
-2. **Start Homing**:
-   `HOME <id>`
-   *Example*: `HOME 1` (Motor 1 runs until it hits a hard stop, then sets position to 0).
-
 ## Python Control Scripts
 
 This repository includes Python scripts to allow you to control the motors directly from your laptop keyboard.
@@ -158,8 +142,6 @@ pip install pyserial pynput
 ## Documentation
 
 For more detailed guides, see the included markdown files:
-- [Homing Guide](HOMING_GUIDE.md)
-- [Homing Configuration](HOMECFG_GUIDE.md)
 - [PID Tuning Guide](PID_TUNING_GUIDE.md)
 - [Gear Ratio Guide](GEAR_RATIO_GUIDE.md)
 - [Multi-Motor Reference](MULTI_MOTOR_REFERENCE.md)
