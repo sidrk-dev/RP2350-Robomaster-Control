@@ -5,6 +5,7 @@
 #include <regex>
 
 // Joints 1, 2, 3 Gear ratio is 94.23076923076923
+// 10:1 gear ratio for the differential wrist
 
 // -------------------- CONFIGURATION --------------------
 #define RX_PIN 4  // gpio4 (MISO)
@@ -14,6 +15,10 @@
 
 #define M2006_GEAR_RATIO 19.0
 #define M3508_GEAR_RATIO 19.0
+
+// -------------------- CYTRON MD10C CONFIG --------------------
+#define CYTRON_PWM_PIN 26
+#define CYTRON_DIR_PIN 27
 
 // Supports IDs 1 through 8
 #define MOTOR_NUM 8
@@ -88,6 +93,16 @@ void setup() {
   sendMsg[1].can_dlc = 8;
 
   pinMode(LED_BUILTIN, OUTPUT);
+
+  // Initialize Cytron MD10C Pines
+  pinMode(CYTRON_PWM_PIN, OUTPUT);
+  pinMode(CYTRON_DIR_PIN, OUTPUT);
+#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_ARCH_RP2350)
+  analogWriteFreq(20000);   // 20kHz, eliminates whine
+  analogWriteResolution(8); // 8-bit (0-255)
+#endif
+  digitalWrite(CYTRON_DIR_PIN, LOW);
+  analogWrite(CYTRON_PWM_PIN, 0);
 
   // Initialize homing parameters with defaults
   for (int i = 0; i < MOTOR_NUM; i++) {
@@ -198,6 +213,12 @@ void printHelp() {
   Serial.println("  Example: HOME 2        (Use current settings)");
   Serial.println("  Example: HOMECFG -5 1.75 300  (Slower, more sensitive)");
   Serial.println("");
+  Serial.println("Cytron Motor Control (MD10C):");
+  Serial.println(
+      "  C <speed>              : Set Cytron motor speed (-255 to 255)");
+  Serial.println("  Example: C 127         (Half speed forward)");
+  Serial.println("  Example: C -255        (Full speed reverse)");
+  Serial.println("");
   Serial.println("S                  : Stop ALL motors immediately");
   Serial.println("H                  : Help");
 }
@@ -264,7 +285,35 @@ void handleSerial() {
       motor[i].target.speed = 0.0f;
       homingState[i].isHoming = false; // Cancel any homing
     }
+    digitalWrite(CYTRON_DIR_PIN, LOW);
+    analogWrite(CYTRON_PWM_PIN, 0);
     Serial.println("STOPPED ALL MOTORS");
+    return;
+  }
+
+  // Command: CYTRON MOTOR CONTROL
+  if (line.startsWith("C ")) {
+    int sp1 = line.indexOf(' ');
+    if (sp1 == -1) {
+      Serial.println("Error: Use format 'C <speed>' (-255 to 255)");
+      return;
+    }
+    int speed = line.substring(sp1 + 1).toInt();
+
+    if (speed > 255)
+      speed = 255;
+    if (speed < -255)
+      speed = -255;
+
+    if (speed >= 0) {
+      digitalWrite(CYTRON_DIR_PIN, HIGH);
+      analogWrite(CYTRON_PWM_PIN, speed);
+    } else {
+      digitalWrite(CYTRON_DIR_PIN, LOW);
+      analogWrite(CYTRON_PWM_PIN, -speed);
+    }
+    Serial.print("Cytron Motor -> ");
+    Serial.println(speed);
     return;
   }
 

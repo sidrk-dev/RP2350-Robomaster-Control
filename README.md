@@ -11,6 +11,8 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - **Homing**: Automatically find physical limits (e.g., endstops) using current sensing (stall detection).
 - **Gear Ratios**: Configure external gear reductions.
 - **Multi-Motor Support**: Control up to 8 motors on a single CAN bus.
+- **Brushed DC Support**: Integrated support for Cytron MD10C motor drivers.
+- **Python Control Scripts**: Control the RoboMaster and Cytron motors directly from your laptop using keyboard inputs.
 
 ## Hardware Setup
 
@@ -39,6 +41,14 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - Connect generic CAN High and CAN Low from the MCP2515 to the CAN High and CAN Low on the motor ESCs.
 - Ensure the CAN bus is terminated with 120Ω resistors at both ends.
 - **Motor IDs**: Set motor IDs (1-8) on the ESCs according to the DJI documentation (usually by pressing the button on the ESC).
+
+### Cytron MD10C Wiring (Optional)
+If you are using a standard brushed DC motor via the Cytron MD10C:
+| Pico Pin | MD10C Pin | Function |
+| :------- | :-------- | :------- |
+| GPIO 26  | PWM       | Motor Speed |
+| GPIO 27  | DIR       | Motor Direction |
+| GND      | GND       | Ground |
 
 ## Software Setup
 
@@ -107,6 +117,7 @@ Open the **Serial Monitor** (Tools > Serial Monitor) and set the baud rate to **
 | `M <id> <rpm>` | Run Motor `<id>` at speed `<rpm>` | `M 2 500` (Motor 2 at 500 RPM) |
 | `CAL <id> <angle>` | Calibrate: Set current position to `<angle>` | `CAL 1 0` (Set current pos as 0°) |
 | `GEAR <id> <ratio>` | Set external gear ratio | `GEAR 1 5` (5:1 reduction) |
+| `C <speed>` | Run Cytron motor at speed `-255` to `255` | `C 127` (50% forward) |
 
 ### PID Tuning
 Adjust the control loop behavior. Values are saved until restart.
@@ -131,6 +142,18 @@ Configure automatic homing based on stall detection (current limit).
 2. **Start Homing**:
    `HOME <id>`
    *Example*: `HOME 1` (Motor 1 runs until it hits a hard stop, then sets position to 0).
+
+## Python Control Scripts
+
+This repository includes Python scripts to allow you to control the motors directly from your laptop keyboard.
+First, make sure to install dependencies:
+```bash
+pip install pyserial pynput
+```
+
+- **`keyboard_control.py`**: Hold `W` to spin RoboMaster Motor 1 forward, `S` to spin backward. `Q` to quit.
+- **`differential_wrist_control.py`**: Uses WASD to control a differential wrist attached to Motors 1 and 2. `W/S` for Pitch, `A/D` for Roll.
+- **`cytron_control.py`**: Hold `U` to spin the Cytron motor forward (PWM 255), `J` to spin backward. `Q` to quit.
 
 ## Documentation
 
