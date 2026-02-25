@@ -11,6 +11,8 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 - **Gear Ratios**: Configure external gear reductions.
 - **Multi-Motor Support**: Control up to 8 motors on a single CAN bus.
 - **Brushed DC Support**: Integrated support for Cytron MD10C motor drivers.
+- **Configuration Management**: GUI utility to tune PID loops, set gear ratios, and save multi-motor parameters to JSON.
+- **Inverse Kinematics UI**: Full 3D 6-DOF visualization and control panel for coordinate based movement.
 - **Python Control Scripts**: Control the RoboMaster and Cytron motors directly from your laptop using keyboard inputs.
 
 ## Hardware Setup
@@ -34,7 +36,7 @@ Control up to 8 DJI RoboMaster motors (M3508/M2006) using a Raspberry Pi Pico an
 
 *Note: The MCP2515 INT pin is not currently used in this code.*
 
-> **⚠️ IMPORTANT**: The Raspberry Pi Pico, MCP2515, and the Motor Controller (ESC) power supply **MUST share a common ground**. Failing to connect the grounds will result in communication failure.
+> **IMPORTANT**: The Raspberry Pi Pico, MCP2515, and the Motor Controller (ESC) power supply **MUST share a common ground**. Failing to connect the grounds will result in communication failure.
 
 ### CAN Bus Wiring
 - Connect generic CAN High and CAN Low from the MCP2515 to the CAN High and CAN Low on the motor ESCs.
@@ -129,12 +131,14 @@ Adjust the control loop behavior. Values are saved until restart.
 
 ## Python Control Scripts
 
-This repository includes Python scripts to allow you to control the motors directly from your laptop keyboard.
+This repository includes Python scripts and graphical interfaces to allow you to control the motors directly from your laptop.
 First, make sure to install dependencies:
 ```bash
-pip install pyserial pynput
+pip install ikpy pyserial matplotlib numpy scipy pynput
 ```
 
+- **`ik_arm_control.py`**: A full 3D Inverse Kinematics visualizer and control panel for a 6-DOF robot arm. Features high refresh rate 3D visualization, WASD positional controls, Roll/Pitch/Yaw orientation controls, and live execution.
+- **`pid_tuner.py`**: A dedicated Tkinter GUI for configuring motor parameters. Tune Angle and Speed PID loops with live telemetry, set external gear ratios, set motor types, and save configurations to `robot_config.json`.
 - **`keyboard_control.py`**: Hold `W` to spin RoboMaster Motor 1 forward, `S` to spin backward. `Q` to quit.
 - **`differential_wrist_control.py`**: Uses WASD to control a differential wrist attached to Motors 1 and 2. `W/S` for Pitch, `A/D` for Roll.
 - **`cytron_control.py`**: Hold `U` to spin the Cytron motor forward (PWM 255), `J` to spin backward. `Q` to quit.
