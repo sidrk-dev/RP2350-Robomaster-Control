@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button, CheckButtons
 import serial
@@ -105,21 +106,29 @@ def connect_serial():
             for i in range(1, 7):
                 mid = str(i)
                 if mid in robot_config:
-                    gr = robot_config[mid].get("gear_ratio", 1.0)
-                    kp = robot_config[mid].get("kp", 5.0)
-                    ki = robot_config[mid].get("ki", 1.0)
-                    kd = robot_config[mid].get("kd", 0.0)
+                    gr  = robot_config[mid].get("gear_ratio", 1.0)
+                    kp  = robot_config[mid].get("kp",  5.0)
+                    ki  = robot_config[mid].get("ki",  1.0)
+                    kd  = robot_config[mid].get("kd",  0.0)
+                    aol = robot_config[mid].get("aol", 500.0)
                     skp = robot_config[mid].get("skp", 0.3)
                     ski = robot_config[mid].get("ski", 0.0)
                     skd = robot_config[mid].get("skd", 0.0)
-                    
-                    # Apply config
-                    send_command(f"GEAR {i} {gr}")
+                    sol = robot_config[mid].get("sol", 20.0)
+                    mn  = robot_config[mid].get("min_angle",  0.0)
+                    mx  = robot_config[mid].get("max_angle",  360.0)
+
+                    batch = (
+                        f"GEAR {i} {gr}"
+                        f"; JLIM {i} {mn:.1f} {mx:.1f}"
+                        f"; KP {i} {kp:.4f}; KI {i} {ki:.4f}; KD {i} {kd:.4f}; AOL {i} {aol:.2f}"
+                        f"; SKP {i} {skp:.4f}; SKI {i} {ski:.4f}; SKD {i} {skd:.4f}; SOL {i} {sol:.2f}"
+                    )
+                    send_command(batch)
                     time.sleep(0.05)
-                    send_command(f"AP {i} {kp:.2f} {ki:.2f} {kd:.2f}")
-                    time.sleep(0.05)
-                    send_command(f"SP {i} {skp:.2f} {ski:.2f} {skd:.2f}")
-                    time.sleep(0.05)
+            
+            # Enable telemetry for all motors so live position display works
+            send_command("T")
         except Exception as e:
             print(f"Warning: Failed to load and apply robot_config.json: {e}")
             
@@ -147,13 +156,22 @@ def send_command(cmd):
             print(f"Error sending command: {e}")
 
 def send_joints_to_arm(joint_angles_rad):
-    # joint_angles_rad usually contains base_link (idx 0) and N joints (idx 1-N)
+    """Send IK joint angles to motors, applying zero_offset and clamping to limits."""
+    cmds = []
     for i in range(1, min(7, len(joint_angles_rad))):
+        mid = str(i)
+        zero_off = robot_config.get(mid, {}).get("zero_offset", 0.0)
+        min_a    = robot_config.get(mid, {}).get("min_angle",  0.0)
+        max_a    = robot_config.get(mid, {}).get("max_angle",  360.0)
+
         deg = np.degrees(joint_angles_rad[i])
-        # Normalize to 0-360
-        deg = deg % 360.0
-        cmd = f"P {i} {deg:.2f}"
-        send_command(cmd)
+        # Apply zero offset: motor_angle = IK_angle + zero_offset
+        deg = (deg + zero_off) % 360.0
+        # Clamp to physical limits
+        deg = max(min_a, min(max_a, deg))
+        cmds.append(f"P {i} {deg:.2f}")
+    if cmds:
+        send_command(";".join(cmds))
 
 # --- UI and Visualization ---
 # Key states
@@ -512,6 +530,10 @@ def toggle_live_update(label):
     else:
         print("Live update DISABLED.")
 
+def emergency_stop_callback(event):
+    print("EMERGENCY STOP TRIGGERED!")
+    send_command("S")
+
 def main():
     global my_chain, fig, ax, ax_top, ax_side
     global slider_x, slider_y, slider_z, slider_step, txt_angles
@@ -531,6 +553,28 @@ def main():
 
         my_chain = Chain.from_urdf_file(temp_path)
         
+        # Patch joint limits into ikpy from robot_config.json
+        # Links 1..N correspond to joints 1..N (link 0 is the base).
+        # Bounds are in radians, relative to the URDF/IK zero which is offset
+        # from the physical motor zero by zero_offset degrees.
+        active_joint_idx = 0
+        for link_idx, link in enumerate(my_chain.links):
+            if link_idx == 0:
+                continue  # skip base
+            active_joint_idx += 1
+            mid = str(active_joint_idx)
+            if mid in robot_config:
+                mn   = robot_config[mid].get("min_angle",  0.0)
+                mx   = robot_config[mid].get("max_angle",  360.0)
+                zoff = robot_config[mid].get("zero_offset", 0.0)
+                # Convert physical degree limits to IK-frame radians
+                lower = math.radians(mn - zoff)
+                upper = math.radians(mx - zoff)
+                if hasattr(link, 'bounds'):
+                    link.bounds = (lower, upper)
+            if active_joint_idx >= 6:
+                break
+
         # Determine number of joints in the chain, ignoring the Base link (which is usually index 0)
         # We need this to safely map the real arm joints dynamically:
         global current_joint_angles
@@ -649,10 +693,17 @@ def main():
     chk_live = CheckButtons(ax_live, ['Live Execute'], [live_update])
     chk_live.on_clicked(toggle_live_update)
 
+    current_y -= 0.06
+    ax_stop = plt.axes([0.65, current_y, 0.28, 0.05])
+    btn_stop = Button(ax_stop, 'EMERGENCY STOP', color='salmon', hovercolor='red')
+    btn_stop.label.set_fontweight('bold')
+    btn_stop.on_clicked(emergency_stop_callback)
+
     print("\n--- Controls ---")
     print("Use sliders or keys to modify the GOAL target (X, Y, Z).")
     print("Click 'Preview (Plan)' to simulate the arm moving from current state to the goal state.")
     print("Click 'Execute' to send the goal angles to the hardware and update the current state.")
+    print("Click 'EMERGENCY STOP' to immediately stop all motors.")
     print("Tick 'Live Execute' to automatically execute immediately when moving.")
     print("Close the window to exit.")
     
@@ -665,8 +716,8 @@ def main():
     print("Hold SHIFT + WASD/QE to adjust the Roll/Pitch/Yaw instead.")
     print("Use ARROW KEYS to rotate the Main Camera View.")
 
-    # Start matplotlib timer for smooth keyboard polling (run very fast since render is now snappy!)
-    timer = fig.canvas.new_timer(interval=25)
+    # Start matplotlib timer for smooth keyboard polling
+    timer = fig.canvas.new_timer(interval=10)
     timer.add_callback(keyboard_update_loop)
     timer.start()
 

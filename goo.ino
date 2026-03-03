@@ -8,10 +8,15 @@
 // 10:1 gear ratio for the differential wrist
 
 // -------------------- CONFIGURATION --------------------
-#define RX_PIN 4  // gpio4 (MISO)
+/*#define RX_PIN 4  // gpio4 (MISO)
 #define CS_PIN 5  // gpio5 (CS)x
 #define SCK_PIN 6 // gpio6 (SCK)
-#define TX_PIN 7  // gpio7 (MOSI)
+#define TX_PIN 7  // gpio7 (MOSI)*/
+
+#define RX_PIN 4  // D9  / GPIO4 (SPI0_MISO)
+#define CS_PIN 1  // D7  / GPIO1 (SPI0_CSn)
+#define SCK_PIN 2 // D8  / GPIO2 (SPI0_SCK)
+#define TX_PIN 3  // D10 / GPIO3 (SPI0_MOSI)
 
 #define M2006_GEAR_RATIO 19.0
 #define M3508_GEAR_RATIO 19.0
@@ -35,6 +40,20 @@ RPI_PICO_Timer sendTimer(1);
 // -------------------- STATE MANAGEMENT --------------------
 motor_t motor[MOTOR_NUM];
 pidInterval_t pidInterval = {8, 4, 2};
+bool motorTelemetryEnabled[MOTOR_NUM] =
+    {}; // per-motor telemetry toggle (T command)
+
+// Per-joint physical limits (degrees). Enforced in P and PR commands.
+// Defaults: 0 to 360 (full rotation). Set via JLIM command.
+float jointMin[MOTOR_NUM];
+float jointMax[MOTOR_NUM];
+
+// Per-joint position offset (degrees, 0-360).
+// zeroAtPhysical[i] = the physical encoder reading (mod 360) that
+// corresponds to logical 0 degrees. Set by the CAL command.
+// P command converts: physicalTarget = (logicalTarget + zeroAtPhysical[i]) %
+// 360
+float zeroAtPhysical[MOTOR_NUM];
 
 struct {
   bool recvMotor = false;
@@ -54,6 +73,7 @@ bool recvMotorFlag(struct repeating_timer *t);
 bool sendMotorFlag(struct repeating_timer *t);
 void printHelp();
 void handleSerial();
+void processCommand(String line);
 
 // -------------------- SETUP --------------------
 void setup() {
@@ -63,6 +83,13 @@ void setup() {
   SPIinit();
   MCPinit();
   setMotorParam();
+
+  // Initialize joint limits to full range and zero offsets
+  for (int i = 0; i < MOTOR_NUM; i++) {
+    jointMin[i] = 0.0f;
+    jointMax[i] = 360.0f;
+    zeroAtPhysical[i] = 0.0f; // no offset by default
+  }
 
   mc.setMotor(motor, MOTOR_NUM);
   mc.setPidInterval(&pidInterval);
@@ -99,21 +126,26 @@ void setup() {
 void loop() {
   handleSerial();
 
-  // Status Printer for motors in ANGLE mode
+  // Status Printer: prints any motor with telemetry enabled (via T command) or
+  // in ANGLE mode
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint > 200) {
-    bool anyInAngleMode = false;
+    bool anyPrinted = false;
     for (int i = 0; i < MOTOR_NUM; i++) {
-      if (motor[i].mode == MODE::ANGLE) {
-        anyInAngleMode = true;
-        float currentMod = fmod(motor[i].totalAngle, 360.0);
-        if (currentMod < 0)
-          currentMod += 360.0;
+      if (motor[i].mode == MODE::ANGLE || motorTelemetryEnabled[i]) {
+        anyPrinted = true;
+        float physMod = fmod(motor[i].totalAngle, 360.0f);
+        if (physMod < 0)
+          physMod += 360.0f;
+        // Logical = what P commands use; matches CAL-set zero
+        float logicalMod = fmod(physMod - zeroAtPhysical[i] + 360.0f, 360.0f);
 
         Serial.print("M");
         Serial.print(i + 1);
-        Serial.print(" POS:");
-        Serial.print(currentMod, 1);
+        Serial.print(" POS:"); // logical degrees (matches P command)
+        Serial.print(logicalMod, 1);
+        Serial.print(" PHYS:"); // raw physical encoder reading
+        Serial.print(physMod, 1);
         Serial.print(" Tot:");
         Serial.print(motor[i].totalAngle, 1);
         Serial.print(" RPM:");
@@ -123,7 +155,7 @@ void loop() {
         Serial.print(" | ");
       }
     }
-    if (anyInAngleMode)
+    if (anyPrinted)
       Serial.println();
     lastPrint = millis();
   }
@@ -146,48 +178,54 @@ void loop() {
 // -------------------- SERIAL COMMANDS --------------------
 void printHelp() {
   Serial.println("\n=== RoboMaster Motor Control ===");
-  Serial.println("Position Control (All Motors):");
-  Serial.println(
-      "  P <id> <angle>   : Move Motor <id> to absolute angle (0-360)");
-  Serial.println("  Example: P 1 90  (Motor 1 to 90 degrees)");
-  Serial.println("  Example: P 2 270 (Motor 2 to 270 degrees)");
+  Serial.println("  Use * as <id> to target ALL motors.  Separate cmds with ; "
+                 "for batching.");
   Serial.println("");
-  Serial.println("Speed Control (All Motors):");
+  Serial.println("Position Control:");
+  Serial.println("  P <id> <angle>    : Move to absolute angle (0-360)");
   Serial.println(
-      "  M <id> <speed>   : Set Motor <id> to <speed> RPM (continuous)");
-  Serial.println("  Example: M 2 500 (Motor 2, Forward 500rpm)");
-  Serial.println("  Example: M 3 -300 (Motor 3, Reverse 300rpm)");
+      "  PR <id> <delta>   : Move RELATIVE delta degrees from current");
+  Serial.println("  Example: P 1 90 | P * 0 | PR 2 -45");
   Serial.println("");
-  Serial.println("PID Tuning (All Motors):");
-  Serial.println(
-      "  AP <id> <kp> <ki> <kd> : Set Angle PID gains for Motor <id>");
-  Serial.println(
-      "  SP <id> <kp> <ki> <kd> : Set Speed PID gains for Motor <id>");
-  Serial.println("  SHOW <id>              : Show PID values for Motor <id>");
-  Serial.println("  Example: AP 1 0.5 0 0.1  (Motor 1 angle PID)");
+  Serial.println("Speed Control:");
+  Serial.println("  M <id> <speed>    : Set speed in RPM (continuous)");
+  Serial.println("  Example: M 1 500 | M * -300");
   Serial.println("");
-  Serial.println("Calibration (All Motors):");
-  Serial.println(
-      "  CAL <id> <angle> : Set Motor <id> current position to <angle>");
-  Serial.println("  Example: CAL 1 0   (Motor 1 current position = 0 degrees)");
-  Serial.println(
-      "  Example: CAL 2 180 (Motor 2 current position = 180 degrees)");
+  Serial.println("PID Tuning (full):");
+  Serial.println("  AP <id> <kp> <ki> <kd> : Set all Angle PID gains");
+  Serial.println("  SP <id> <kp> <ki> <kd> : Set all Speed PID gains");
+  Serial.println("PID Tuning (single gain):");
+  Serial.println("  KP  <id> <val>    : Angle Kp only");
+  Serial.println("  KI  <id> <val>    : Angle Ki only");
+  Serial.println("  KD  <id> <val>    : Angle Kd only");
+  Serial.println("  AOL <id> <val>    : Angle output limit (max RPM)");
+  Serial.println("  SKP <id> <val>    : Speed Kp only");
+  Serial.println("  SKI <id> <val>    : Speed Ki only");
+  Serial.println("  SKD <id> <val>    : Speed Kd only");
+  Serial.println("  SOL <id> <val>    : Speed output limit (max Amps)");
+  Serial.println("  SHOW <id>         : Show PID values");
   Serial.println("");
-  Serial.println("Gear Ratio (All Motors):");
-  Serial.println(
-      "  GEAR <id> <ratio> : Set external gear ratio for Motor <id>");
-  Serial.println("  Example: GEAR 1 5   (Motor 1 has 5:1 external gearing)");
-  Serial.println("  Example: GEAR 2 1   (Motor 2 has no external gearing)");
+  Serial.println("Telemetry:");
+  Serial.println("  T             : Toggle telemetry for ALL motors");
+  Serial.println("  T <id>        : Toggle telemetry for one motor");
   Serial.println("");
-
+  Serial.println("Calibration:");
+  Serial.println("  CAL <id> <angle>  : Set current position to <angle>");
+  Serial.println("");
+  Serial.println("Joint Limits:");
+  Serial.println(
+      "  JLIM <id|*> <min> <max> : Set physical angle limits (degrees)");
+  Serial.println(
+      "  Example: JLIM 1 0 270   : Joint 1 can only go 0-270 degrees");
+  Serial.println("");
+  Serial.println("Gear Ratio:");
+  Serial.println("  GEAR <id> <ratio> : Set external gear ratio");
+  Serial.println("");
   Serial.println("Cytron Motor Control (MD10C):");
-  Serial.println(
-      "  C <speed>              : Set Cytron motor speed (-255 to 255)");
-  Serial.println("  Example: C 127         (Half speed forward)");
-  Serial.println("  Example: C -255        (Full speed reverse)");
+  Serial.println("  C <speed>         : Set Cytron speed (-255 to 255)");
   Serial.println("");
-  Serial.println("S                  : Stop ALL motors immediately");
-  Serial.println("H                  : Help");
+  Serial.println("S : Stop ALL motors");
+  Serial.println("H : Help");
 }
 
 void handleSerial() {
@@ -200,6 +238,34 @@ void handleSerial() {
     return;
   line.toUpperCase();
 
+  // --- Semicolon batch: split by ';' and process each sub-command ---
+  int start = 0;
+  while (true) {
+    int sep = line.indexOf(';', start);
+    String sub =
+        (sep == -1) ? line.substring(start) : line.substring(start, sep);
+    sub.trim();
+    if (sub.length() > 0)
+      processCommand(sub);
+    if (sep == -1)
+      break;
+    start = sep + 1;
+  }
+}
+
+// Resolves a motor ID string: returns -1 for wildcard *, else the 1-based int
+// Sets isWildcard true when * is used
+static void dispatchMotorIDs(String idStr, bool &isWildcard, int &singleId) {
+  if (idStr == "*") {
+    isWildcard = true;
+    singleId = -1;
+  } else {
+    isWildcard = false;
+    singleId = idStr.toInt();
+  }
+}
+
+void processCommand(String line) {
   // Command: HELP
   if (line == "H") {
     printHelp();
@@ -250,10 +316,47 @@ void handleSerial() {
     for (int i = 0; i < MOTOR_NUM; i++) {
       motor[i].mode = MODE::SPEED;
       motor[i].target.speed = 0.0f;
+      // Reset PID state to prevent integral windup from keeping motors moving
+      motor[i].speedPid.integral = 0;
+      motor[i].speedPid.prevError = 0;
+      motor[i].anglePid.integral = 0;
+      motor[i].anglePid.prevError = 0;
     }
     digitalWrite(CYTRON_DIR_PIN, LOW);
     analogWrite(CYTRON_PWM_PIN, 0);
     Serial.println("STOPPED ALL MOTORS");
+    return;
+  }
+
+  // Command: TELEMETRY TOGGLE -> "T" / explicit "TON" / "TOFF" / "T <id>"
+  if (line == "T" || line == "TON" || line == "TOFF" || line.startsWith("T ")) {
+    if (line == "TON") {
+      for (int i = 0; i < MOTOR_NUM; i++)
+        motorTelemetryEnabled[i] = true;
+      Serial.println("Telemetry ALL motors: ON");
+    } else if (line == "TOFF") {
+      for (int i = 0; i < MOTOR_NUM; i++)
+        motorTelemetryEnabled[i] = false;
+      Serial.println("Telemetry ALL motors: OFF");
+    } else if (line == "T") {
+      // Toggle all motors — use the state of motor 0 as the reference
+      bool newState = !motorTelemetryEnabled[0];
+      for (int i = 0; i < MOTOR_NUM; i++)
+        motorTelemetryEnabled[i] = newState;
+      Serial.print("Telemetry ALL motors: ");
+      Serial.println(newState ? "ON" : "OFF");
+    } else {
+      int id = line.substring(2).toInt();
+      if (id < 1 || id > MOTOR_NUM) {
+        Serial.print("Error: ID must be 1-");
+        Serial.println(MOTOR_NUM);
+        return;
+      }
+      motorTelemetryEnabled[id - 1] = !motorTelemetryEnabled[id - 1];
+      Serial.print("Telemetry M");
+      Serial.print(id);
+      Serial.println(motorTelemetryEnabled[id - 1] ? ": ON" : ": OFF");
+    }
     return;
   }
 
@@ -283,86 +386,154 @@ void handleSerial() {
     return;
   }
 
-  // Command: SET ANGLE PID
+  // Command: SET ANGLE PID -> "AP <id|*> <kp> <ki> <kd>"
   if (line.startsWith("AP ")) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
     int sp3 = line.indexOf(' ', sp2 + 1);
     int sp4 = line.indexOf(' ', sp3 + 1);
-
     if (sp1 == -1 || sp2 == -1 || sp3 == -1 || sp4 == -1) {
-      Serial.println("Error: Use format 'AP <id> <kp> <ki> <kd>'");
+      Serial.println("Error: Use format 'AP <id|*> <kp> <ki> <kd>'");
       return;
     }
-
-    int id = line.substring(sp1 + 1, sp2).toInt();
+    String idStr = line.substring(sp1 + 1, sp2);
     float kp = line.substring(sp2 + 1, sp3).toFloat();
     float ki = line.substring(sp3 + 1, sp4).toFloat();
     float kd = line.substring(sp4 + 1).toFloat();
-
-    if (id < 1 || id > MOTOR_NUM) {
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
-
-    int idx = id - 1;
-    motor[idx].anglePid.kp = kp;
-    motor[idx].anglePid.ki = ki;
-    motor[idx].anglePid.kd = kd;
-    motor[idx].anglePid.integral = 0;  // Reset integral
-    motor[idx].anglePid.prevError = 0; // Reset derivative
-
-    Serial.print("Motor ");
-    Serial.print(id);
-    Serial.print(" Angle PID updated: Kp=");
-    Serial.print(kp);
-    Serial.print(", Ki=");
-    Serial.print(ki);
-    Serial.print(", Kd=");
-    Serial.println(kd);
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      motor[i].anglePid.kp = kp;
+      motor[i].anglePid.ki = ki;
+      motor[i].anglePid.kd = kd;
+      motor[i].anglePid.integral = 0;
+      motor[i].anglePid.prevError = 0;
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" APid: Kp=");
+      Serial.print(kp);
+      Serial.print(" Ki=");
+      Serial.print(ki);
+      Serial.print(" Kd=");
+      Serial.println(kd);
+    }
     return;
   }
 
-  // Command: SET SPEED PID
+  // Command: SET SPEED PID -> "SP <id|*> <kp> <ki> <kd>"
   if (line.startsWith("SP ")) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
     int sp3 = line.indexOf(' ', sp2 + 1);
     int sp4 = line.indexOf(' ', sp3 + 1);
-
     if (sp1 == -1 || sp2 == -1 || sp3 == -1 || sp4 == -1) {
-      Serial.println("Error: Use format 'SP <id> <kp> <ki> <kd>'");
+      Serial.println("Error: Use format 'SP <id|*> <kp> <ki> <kd>'");
       return;
     }
-
-    int id = line.substring(sp1 + 1, sp2).toInt();
+    String idStr = line.substring(sp1 + 1, sp2);
     float kp = line.substring(sp2 + 1, sp3).toFloat();
     float ki = line.substring(sp3 + 1, sp4).toFloat();
     float kd = line.substring(sp4 + 1).toFloat();
-
-    if (id < 1 || id > MOTOR_NUM) {
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
-
-    int idx = id - 1;
-    motor[idx].speedPid.kp = kp;
-    motor[idx].speedPid.ki = ki;
-    motor[idx].speedPid.kd = kd;
-    motor[idx].speedPid.integral = 0;  // Reset integral
-    motor[idx].speedPid.prevError = 0; // Reset derivative
-
-    Serial.print("Motor ");
-    Serial.print(id);
-    Serial.print(" Speed PID updated: Kp=");
-    Serial.print(kp);
-    Serial.print(", Ki=");
-    Serial.print(ki);
-    Serial.print(", Kd=");
-    Serial.println(kd);
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      motor[i].speedPid.kp = kp;
+      motor[i].speedPid.ki = ki;
+      motor[i].speedPid.kd = kd;
+      motor[i].speedPid.integral = 0;
+      motor[i].speedPid.prevError = 0;
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" SPid: Kp=");
+      Serial.print(kp);
+      Serial.print(" Ki=");
+      Serial.print(ki);
+      Serial.print(" Kd=");
+      Serial.println(kd);
+    }
     return;
+  }
+
+  // Command: SINGLE GAIN PID -> "KP/KI/KD/AOL/SKP/SKI/SKD/SOL <id> <val>"
+  const char *singleGainCmds[] = {"KP ",  "KI ",  "KD ",  "AOL ",
+                                  "SKP ", "SKI ", "SKD ", "SOL "};
+  for (int g = 0; g < 8; g++) {
+    if (line.startsWith(singleGainCmds[g])) {
+      int sp1 = line.indexOf(' ');
+      int sp2 = line.indexOf(' ', sp1 + 1);
+      if (sp1 == -1 || sp2 == -1) {
+        Serial.print("Error: Use format '");
+        Serial.print(singleGainCmds[g]);
+        Serial.println("<id> <val>'");
+        return;
+      }
+      String idStr = line.substring(sp1 + 1, sp2);
+      float val = line.substring(sp2 + 1).toFloat();
+      bool isWild;
+      int singleId;
+      dispatchMotorIDs(idStr, isWild, singleId);
+      int startM = isWild ? 0 : singleId - 1;
+      int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+      if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+        Serial.print("Error: ID must be 1-");
+        Serial.println(MOTOR_NUM);
+        return;
+      }
+      for (int i = startM; i <= endM; i++) {
+        switch (g) {
+        case 0:
+          motor[i].anglePid.kp = val;
+          break;
+        case 1:
+          motor[i].anglePid.ki = val;
+          motor[i].anglePid.integral = 0;
+          break;
+        case 2:
+          motor[i].anglePid.kd = val;
+          motor[i].anglePid.prevError = 0;
+          break;
+        case 3: // AOL
+          motor[i].anglePid.outputLimit = val;
+          break;
+        case 4:
+          motor[i].speedPid.kp = val;
+          break;
+        case 5:
+          motor[i].speedPid.ki = val;
+          motor[i].speedPid.integral = 0;
+          break;
+        case 6:
+          motor[i].speedPid.kd = val;
+          motor[i].speedPid.prevError = 0;
+          break;
+        case 7: // SOL
+          motor[i].speedPid.outputLimit = val;
+          break;
+        }
+        Serial.print(singleGainCmds[g]);
+        Serial.print("M");
+        Serial.print(i + 1);
+        Serial.print(" = ");
+        Serial.println(val);
+      }
+      return;
+    }
   }
 
   // Command: SET EXTERNAL GEAR RATIO
@@ -371,34 +542,77 @@ void handleSerial() {
     int sp2 = line.indexOf(' ', sp1 + 1);
 
     if (sp1 == -1 || sp2 == -1) {
-      Serial.println("Error: Use format 'GEAR <id> <ratio>'");
+      Serial.println("Error: Use format 'GEAR <id|*> <ratio>'");
       return;
     }
 
-    int id = line.substring(sp1 + 1, sp2).toInt();
+    String idStr = line.substring(sp1 + 1, sp2);
     float ratio = line.substring(sp2 + 1).toFloat();
-
-    if (id < 1 || id > MOTOR_NUM) {
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
-
     if (ratio <= 0) {
       Serial.println("Error: Gear ratio must be positive");
       return;
     }
 
-    int idx = id - 1;
-    motor[idx].externalGearRatio = ratio;
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      motor[i].externalGearRatio = ratio;
+      Serial.print("Motor ");
+      Serial.print(i + 1);
+      Serial.print(" gear ratio: ");
+      Serial.print(ratio);
+      Serial.print(":1 (Total: ");
+      Serial.print(motor[i].gearRatio * motor[i].externalGearRatio);
+      Serial.println(":1)");
+    }
+    return;
+  }
 
-    Serial.print("Motor ");
-    Serial.print(id);
-    Serial.print(" external gear ratio set to ");
-    Serial.print(ratio);
-    Serial.print(":1 (Total ratio: ");
-    Serial.print(motor[idx].gearRatio * motor[idx].externalGearRatio);
-    Serial.println(":1)");
+  // Command: JOINT LIMITS -> "JLIM <id|*> <min> <max>"
+  if (line.startsWith("JLIM ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    int sp3 = line.indexOf(' ', sp2 + 1);
+    if (sp1 == -1 || sp2 == -1 || sp3 == -1) {
+      Serial.println("Error: Use format 'JLIM <id|*> <min> <max>'");
+      return;
+    }
+    String idStr = line.substring(sp1 + 1, sp2);
+    float minA = line.substring(sp2 + 1, sp3).toFloat();
+    float maxA = line.substring(sp3 + 1).toFloat();
+    if (maxA <= minA) {
+      Serial.println("Error: max must be > min");
+      return;
+    }
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+      Serial.print("Error: ID must be 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      jointMin[i] = minA;
+      jointMax[i] = maxA;
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" limits: [");
+      Serial.print(minA);
+      Serial.print(", ");
+      Serial.print(maxA);
+      Serial.println("]");
+    }
     return;
   }
 
@@ -408,161 +622,214 @@ void handleSerial() {
     int sp2 = line.indexOf(' ', sp1 + 1);
 
     if (sp1 == -1 || sp2 == -1) {
-      Serial.println("Error: Use format 'CAL <id> <angle>'");
+      Serial.println("Error: Use format 'CAL <id|*> <angle>'");
       return;
     }
 
-    int id = line.substring(sp1 + 1, sp2).toInt();
+    String idStr = line.substring(sp1 + 1, sp2);
     float calibAngle = line.substring(sp2 + 1).toFloat();
-
-    if (id < 1 || id > MOTOR_NUM) {
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
-
-    int idx = id - 1;
-
-    // Constrain to 0-360
     while (calibAngle >= 360.0)
       calibAngle -= 360.0;
     while (calibAngle < 0.0)
       calibAngle += 360.0;
 
-    // CRITICAL: Stop the motor first and switch to SPEED mode
-    motor[idx].mode = MODE::SPEED;
-    motor[idx].target.speed = 0.0;
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      motor[i].mode = MODE::SPEED;
+      motor[i].target.speed = 0.0;
+      motor[i].speedPid.integral = 0;
+      motor[i].speedPid.prevError = 0;
+      motor[i].anglePid.integral = 0;
+      motor[i].anglePid.prevError = 0;
 
-    // Get current raw encoder angle (0-360 from the encoder itself)
-    float currentRawAngle = motor[idx].actualAngle;
+      // Use totalAngle (same as the telemetry printer) — NOT actualAngle
+      // which may be the raw motor shaft angle before gear reduction.
+      float physMod = fmod(motor[i].totalAngle, 360.0f);
+      if (physMod < 0)
+        physMod += 360.0f;
+      // zeroAtPhysical: the totalAngle%360 value that maps to logical 0
+      // degrees. E.g., if physMod=90 and calibAngle=0 → offset=90 → future P 0
+      // targets physical 90.
+      zeroAtPhysical[i] = fmod(physMod - calibAngle + 360.0f, 360.0f);
 
-    // Calculate what roundCount should be to make totalAngle equal calibAngle
-    // totalAngle = (roundCount * 360) + (rawAngle / gearRatio)
-    // We want: calibAngle = (roundCount * 360) + (currentRawAngle)
-    // So: roundCount = (calibAngle - currentRawAngle) / 360, rounded to nearest
-    // int
-
-    float offset = calibAngle - currentRawAngle;
-    motor[idx].roundCount = (int32_t)round(offset / 360.0f);
-
-    // Now recalculate totalAngle with the new roundCount
-    motor[idx].totalAngle = (motor[idx].roundCount * 360.0f) + currentRawAngle;
-
-    // Update target angle to match so there's no error if switched back to
-    // ANGLE mode
-    motor[idx].target.angle = motor[idx].totalAngle;
-
-    // Reset PID states to prevent jumps
-    motor[idx].anglePid.integral = 0;
-    motor[idx].anglePid.prevError = 0;
-    motor[idx].speedPid.integral = 0;
-    motor[idx].speedPid.prevError = 0;
-
-    Serial.print("Motor ");
-    Serial.print(id);
-    Serial.print(" calibrated: Current position set to ");
-    Serial.print(motor[idx].totalAngle);
-    Serial.print(" degrees (target was ");
-    Serial.print(calibAngle);
-    Serial.println(")");
-    Serial.print("Motor stopped. Use 'P ");
-    Serial.print(id);
-    Serial.println(" <angle>' to move to new position.");
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" CAL: totalAngle%360=");
+      Serial.print(physMod);
+      Serial.print(" -> logical ");
+      Serial.print(calibAngle);
+      Serial.print(" (offset=");
+      Serial.print(zeroAtPhysical[i]);
+      Serial.println(")");
+    }
     return;
   }
 
-  // Command: POSITION CONTROL (All Motors)
+  // Command: RELATIVE POSITION -> "PR <id|*> <delta>"
+  if (line.startsWith("PR ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'PR <id|*> <delta>'");
+      return;
+    }
+    String idStr = line.substring(sp1 + 1, sp2);
+    float delta = line.substring(sp2 + 1).toFloat();
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+      Serial.print("Error: ID must be 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      // Base: use target.angle if already in ANGLE mode (accumulates rapid
+      // presses correctly), otherwise use totalAngle (actual position) to avoid
+      // jumping from a stale target.
+      float base = (motor[i].mode == MODE::ANGLE) ? motor[i].target.angle
+                                                  : motor[i].totalAngle;
+      float newTarget = base + delta;
+      float newMod = fmod(newTarget, 360.0f);
+      if (newMod < 0)
+        newMod += 360.0f;
+
+      // Clamp to physical limits (stop at boundary, never reject)
+      if (newMod < jointMin[i])
+        newTarget += (jointMin[i] - newMod);
+      else if (newMod > jointMax[i])
+        newTarget -= (newMod - jointMax[i]);
+
+      motor[i].mode = MODE::ANGLE;
+      motor[i].target.angle = newTarget;
+      float finalMod = fmod(newTarget, 360.0f);
+      if (finalMod < 0)
+        finalMod += 360.0f;
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" PR ");
+      Serial.print(delta);
+      Serial.print(" -> ");
+      Serial.println(finalMod);
+    }
+    return;
+  }
+
+  // Command: POSITION CONTROL -> "P <id|*> <angle>"
   if (line.startsWith("P ")) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
 
     if (sp1 == -1 || sp2 == -1) {
-      Serial.println("Error: Use format 'P <id> <angle>'");
+      Serial.println("Error: Use format 'P <id|*> <angle>'");
       return;
     }
 
-    int id = line.substring(sp1 + 1, sp2).toInt();
+    String idStr = line.substring(sp1 + 1, sp2);
     float targetDeg = line.substring(sp2 + 1).toFloat();
-
-    if (id < 1 || id > MOTOR_NUM) {
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
 
-    int idx = id - 1;
+    // NOTE: Do NOT normalize or clamp targetDeg here — it's a LOGICAL angle.
+    // Normalization and clamping happen per-motor inside the loop,
+    // after the zero offset is applied.
 
-    // Constrain input to 0-360
-    while (targetDeg >= 360.0)
-      targetDeg -= 360.0;
-    while (targetDeg < 0.0)
-      targetDeg += 360.0;
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      // Convert logical -> physical via zero offset
+      float physDeg = fmod(targetDeg + zeroAtPhysical[i], 360.0f);
+      if (physDeg < 0)
+        physDeg += 360.0f;
 
-    // Get current physical angle
-    float currentTotal = motor[idx].totalAngle;
+      // Per-motor clamping to physical limits
+      if (physDeg < jointMin[i])
+        physDeg = jointMin[i];
+      if (physDeg > jointMax[i])
+        physDeg = jointMax[i];
 
-    // Calculate current position in 0-360 space
-    float currentMod = fmod(currentTotal, 360.0);
-    if (currentMod < 0)
-      currentMod += 360.0;
+      // Shortest-path from current position to target
+      float currentTotal = motor[i].totalAngle;
+      float currentMod = fmod(currentTotal, 360.0f);
+      if (currentMod < 0)
+        currentMod += 360.0f;
+      float error = physDeg - currentMod;
+      if (error > 180.0f)
+        error -= 360.0f;
+      if (error < -180.0f)
+        error += 360.0f;
 
-    // Calculate shortest path error
-    float error = targetDeg - currentMod;
+      motor[i].mode = MODE::ANGLE;
+      motor[i].target.angle = currentTotal + error;
+      // Reset angle PID to prevent stale integral from fighting the new target
+      motor[i].anglePid.integral = 0;
+      motor[i].anglePid.prevError = 0;
 
-    // Normalize error to shortest path (-180 to +180)
-    if (error > 180.0)
-      error -= 360.0;
-    if (error < -180.0)
-      error += 360.0;
-
-    // Apply to Absolute Target
-    motor[idx].mode = MODE::ANGLE;
-    motor[idx].target.angle = currentTotal + error;
-
-    Serial.print("M");
-    Serial.print(id);
-    Serial.print(" Going to: ");
-    Serial.print(targetDeg);
-    Serial.print(" | Path: ");
-    Serial.print(error);
-    Serial.print(" | Abs Target: ");
-    Serial.println(motor[idx].target.angle);
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" -> phys ");
+      Serial.print(physDeg);
+      Serial.print(" (err=");
+      Serial.print(error);
+      Serial.println(")");
+    }
     return;
   }
 
-  // Command: SPEED CONTROL -> "M <id> <speed>"
+  // Command: SPEED CONTROL -> "M <id|*> <speed>"
   if (line.startsWith("M ")) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
 
     if (sp1 == -1 || sp2 == -1) {
-      Serial.println("Error: Use format 'M <id> <speed>'");
+      Serial.println("Error: Use format 'M <id|*> <speed>'");
       return;
     }
 
     String idStr = line.substring(sp1 + 1, sp2);
-    String speedStr = line.substring(sp2 + 1);
-
-    int id = idStr.toInt();
-    float speed = speedStr.toFloat();
-
-    // Validation
-    if (id < 1 || id > MOTOR_NUM) {
+    float speed = line.substring(sp2 + 1).toFloat();
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
       Serial.print("Error: ID must be 1-");
       Serial.println(MOTOR_NUM);
       return;
     }
-
-    // Apply Command
-    int idx = id - 1;
-    motor[idx].mode = MODE::SPEED;
-    motor[idx].target.speed = speed;
-
-    Serial.print("Motor ");
-    Serial.print(id);
-    Serial.print(" -> ");
-    Serial.print(speed);
-    Serial.println(" rpm (continuous)");
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      motor[i].mode = MODE::SPEED;
+      motor[i].target.speed = speed;
+      // Reset PID state when stopping to prevent integral windup from fighting
+      // the stop
+      if (fabsf(speed) < 1.0f) {
+        motor[i].speedPid.integral = 0;
+        motor[i].speedPid.prevError = 0;
+      }
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" -> ");
+      Serial.print(speed);
+      Serial.println(" rpm");
+    }
     return;
   }
 

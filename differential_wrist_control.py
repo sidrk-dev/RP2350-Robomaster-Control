@@ -76,18 +76,11 @@ def update_motors():
         current_m1 = m1_target
         current_m2 = m2_target
         
-        # Send new motor speeds to both motors
-        send_command(f"M {MOTOR_1_ID} {current_m1}")
-        
-        # A tiny delay ensures the Arduino has enough time to parse the first command
-        time.sleep(0.005) 
-        
-        send_command(f"M {MOTOR_2_ID} {current_m2}")
+        # Batch both motor commands into one serial write (no inter-command delay needed)
+        send_command(f"M {MOTOR_1_ID} {current_m1}; M {MOTOR_2_ID} {current_m2}")
         
         if current_m1 == 0 and current_m2 == 0:
             print("Stopping Motors...")
-            # Optional: send 'S' to cleanly stop all instead of sending 0 speed
-            # send_command("S") 
         else:
             print(f"Motor 1: {current_m1:>4} RPM | Motor 2: {current_m2:>4} RPM")
 

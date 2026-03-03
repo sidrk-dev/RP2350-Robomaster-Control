@@ -3,12 +3,17 @@
         "1": {
             "type": "M3508",
             "gear_ratio": 94.23076923076923,
-            "kp": 6.0,
+            "kp": 60.0,
             "ki": 0.1,
             "kd": 0.0025,
             "skp": 0.01,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 100.0,
+            "sol": 20.0,
+            "min_angle": 180.0,
+            "max_angle": 0.0,
+            "zero_offset": 0.0
         },
         "2": {
             "type": "M2006",
@@ -18,7 +23,12 @@
             "kd": 0.0,
             "skp": 0.3,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 500.0,
+            "sol": 20.0,
+            "min_angle": 0.0,
+            "max_angle": 360.0,
+            "zero_offset": 0.0
         },
         "3": {
             "type": "M2006",
@@ -28,7 +38,12 @@
             "kd": 0.0,
             "skp": 0.3,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 500.0,
+            "sol": 20.0,
+            "min_angle": 0.0,
+            "max_angle": 360.0,
+            "zero_offset": 0.0
         },
         "4": {
             "type": "M2006",
@@ -38,7 +53,12 @@
             "kd": 0.0,
             "skp": 0.3,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 500.0,
+            "sol": 20.0,
+            "min_angle": 0.0,
+            "max_angle": 360.0,
+            "zero_offset": 0.0
         },
         "5": {
             "type": "M2006",
@@ -48,7 +68,12 @@
             "kd": 0.0,
             "skp": 0.3,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 500.0,
+            "sol": 20.0,
+            "min_angle": 0.0,
+            "max_angle": 360.0,
+            "zero_offset": 0.0
         },
         "6": {
             "type": "M2006",
@@ -58,7 +83,12 @@
             "kd": 0.0,
             "skp": 0.3,
             "ski": 0.0,
-            "skd": 0.0
+            "skd": 0.0,
+            "aol": 500.0,
+            "sol": 20.0,
+            "min_angle": 0.0,
+            "max_angle": 360.0,
+            "zero_offset": 0.0
         }
     }
 }

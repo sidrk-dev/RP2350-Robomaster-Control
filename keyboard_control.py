@@ -13,8 +13,8 @@ except ImportError:
 
 # Configuration
 BAUD_RATE = 115200
-MOTOR_ID = 1
-SPEED = 500
+MOTOR_ID = 2
+SPEED = 100
 
 ser = None
 forward_pressed = False
