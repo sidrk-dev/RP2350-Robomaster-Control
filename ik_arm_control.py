@@ -138,12 +138,28 @@ def connect_serial():
         return False
 
 def read_from_port():
+    global actual_joint_angles
+    import re
     while ser and ser.is_open:
         try:
             if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line:
                     print(f"[Arduino] {line}")
+                    # Parse telemetry to update actual_joint_angles for visualization
+                    for token in line.split("|"):
+                        token = token.strip()
+                        if token.startswith("M"):
+                            match = re.search(r"M(\d+)\s+POS:([-\d.]+)", token)
+                            if match:
+                                mid = int(match.group(1))
+                                pos = float(match.group(2))
+                                # Prefer APOS (absolute encoder) if present
+                                apos_match = re.search(r"APOS:([-\d.]+)", token)
+                                if apos_match:
+                                    pos = float(apos_match.group(1))
+                                if actual_joint_angles is not None and mid < len(actual_joint_angles):
+                                    actual_joint_angles[mid] = np.radians(pos)
             time.sleep(0.01)
         except Exception:
             break

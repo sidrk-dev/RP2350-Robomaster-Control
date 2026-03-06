@@ -4,7 +4,6 @@
 #include "src/autowp-mcp2515/mcp2515.h"
 #include <Arduino.h>
 
-
 // C620 feedback frequency (125Hz as per datasheet)
 #define C620_FEEDBACK_125HZ 125.0f
 
@@ -52,10 +51,17 @@ typedef struct {
   float actualCurrent; // Current in Amps
   int16_t temperature; // Motor temperature
 
-  // Angle unwrapping for position control
+  // Angle unwrapping for position control (motor internal encoder)
   float totalAngle;      // Accumulated angle (output shaft degrees)
   uint16_t lastRawAngle; // Last raw encoder value (0-8191)
   int32_t roundCount;    // Number of complete rotations
+
+  // Absolute encoder (AMT203S on SPI1, mounted on gearbox output)
+  bool hasAbsEncoder;           // true if an absolute encoder is mapped
+  float absEncoderAngle;        // Latest single-revolution reading (0-360°)
+  float absEncoderTotalAngle;   // Unwrapped accumulated angle (degrees)
+  uint16_t absEncoderLastRaw;   // Last raw value for unwrapping (0-4095)
+  int32_t absEncoderRoundCount; // Revolution counter for unwrapping
 } motor_t;
 
 // PID calculation intervals

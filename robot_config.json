@@ -11,7 +11,7 @@
             "skd": 0.0,
             "aol": 100.0,
             "sol": 20.0,
-            "min_angle": 180.0,
+            "min_angle": 0.0,
             "max_angle": 0.0,
             "zero_offset": 0.0
         },

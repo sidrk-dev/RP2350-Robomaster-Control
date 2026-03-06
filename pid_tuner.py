@@ -59,6 +59,10 @@ class MotorTab:
         self.lbl_current_rpm = ttk.Label(lf_telemetry, text="--- RPM", foreground="green", font=("Arial", 10, "bold"))
         self.lbl_current_rpm.grid(row=1, column=1, sticky="w")
         
+        ttk.Label(lf_telemetry, text="Abs. Encoder:", font=("Arial", 10, "bold")).grid(row=1, column=2, sticky="e", padx=(20, 5))
+        self.lbl_abs_angle = ttk.Label(lf_telemetry, text="---", foreground="#8B4513", font=("Arial", 10, "bold"))
+        self.lbl_abs_angle.grid(row=1, column=3, sticky="w")
+
         btn_zero = ttk.Button(lf_telemetry, text="Set Zero Position (CAL)", command=self.set_zero)
         btn_zero.grid(row=0, column=4, padx=(20, 0))
 
@@ -237,10 +241,6 @@ class MotorTab:
         self.send_cmd(batch)
 
     def test_move(self, angle):
-        # Clamp to physical joint limits
-        mn = self.var_min.get()
-        mx = self.var_max.get()
-        angle = max(mn, min(mx, float(angle)))
         self.send_cmd(f"P {self.motor_id} {angle}")
         self.lbl_target_angle.config(text=f"{angle}°")
         
@@ -445,6 +445,7 @@ class PIDTunerApp:
         self.log_box.tag_config("telemetry", foreground="#6db3f2")
         self.log_box.tag_config("error",     foreground="#f44747")
         self.log_box.tag_config("info",      foreground="#b5cea8")
+        self.log_box.tag_config("sent",      foreground="#dca54e")
         self._log_line_count = 0
     def find_serial_port(self):
         ports = serial.tools.list_ports.comports()
@@ -507,18 +508,25 @@ class PIDTunerApp:
                                 mid = match.group(1)
                                 pos = match.group(2)
                                 rpm = match.group(3)
+                                # Capture optional APOS (absolute encoder)
+                                apos_match = re.search(r"APOS:([-\d.]+)", token)
+                                apos = apos_match.group(1) if apos_match else None
                                 if mid in self.tabs:
-                                    self.root.after(0, self.update_telemetry_ui, mid, pos, rpm)
+                                    self.root.after(0, self.update_telemetry_ui, mid, pos, rpm, apos)
                                     
                 time.sleep(0.01)
             except Exception:
                 break
                 
-    def update_telemetry_ui(self, mid, pos, rpm="---"):
+    def update_telemetry_ui(self, mid, pos, rpm="---", apos=None):
         if mid in self.tabs:
             tab = self.tabs[mid]
             tab.lbl_current_angle.config(text=f"{pos}°")
             tab.lbl_current_rpm.config(text=f"{rpm} RPM")
+            if apos is not None:
+                tab.lbl_abs_angle.config(text=f"{apos}°")
+            else:
+                tab.lbl_abs_angle.config(text="N/A")
             try:
                 tab._gauge_current_deg = float(pos)
             except ValueError:
@@ -552,11 +560,22 @@ class PIDTunerApp:
             try:
                 self.ser.write((cmd + '\n').encode('utf-8'))
                 self.status_bar.config(text=f"Sent: {cmd}")
+                self.root.after(0, self._log_sent, cmd)
             except Exception as e:
                 messagebox.showerror("Serial Error", f"Failed to send data:\n{e}")
                 self.toggle_serial()
         else:
             self.status_bar.config(text=f"Not connected! (Would have sent: {cmd})")
+
+    def _log_sent(self, cmd):
+        self.log_box.config(state="normal")
+        self.log_box.insert("end", f">>> SENT: {cmd}\n", "sent")
+        self._log_line_count += 1
+        if self._log_line_count > 200:
+            self.log_box.delete("1.0", "2.0")
+            self._log_line_count -= 1
+        self.log_box.see("end")
+        self.log_box.config(state="disabled")
 
     def apply_all(self):
         if not self.ser or not self.ser.is_open:

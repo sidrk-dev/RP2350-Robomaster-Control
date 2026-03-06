@@ -18,12 +18,21 @@
 #define SCK_PIN 2 // D8  / GPIO2 (SPI0_SCK)
 #define TX_PIN 3  // D10 / GPIO3 (SPI0_MOSI)
 
+// -------------------- ABSOLUTE ENCODER (AMT203S on SPI1) --------------------
+#define ENC_SCK_PIN D0  // GPIO26 -> SPI1 SCK
+#define ENC_MOSI_PIN D1 // GPIO27 -> SPI1 MOSI
+#define ENC_MISO_PIN D2 // GPIO28 -> SPI1 MISO
+
+#define ENC_NOP 0x00
+#define ENC_RD_POS 0x10
+#define ENC_SET_ZERO 0x70
+#define ENC_TIMEOUT 100
+
+const uint8_t ENC_CS_PINS[] = {D3, D4};
+const uint8_t NUM_ENCODERS = sizeof(ENC_CS_PINS) / sizeof(ENC_CS_PINS[0]);
+
 #define M2006_GEAR_RATIO 19.0
 #define M3508_GEAR_RATIO 19.0
-
-// -------------------- CYTRON MD10C CONFIG --------------------
-#define CYTRON_PWM_PIN 26
-#define CYTRON_DIR_PIN 27
 
 // Supports IDs 1 through 8
 #define MOTOR_NUM 8
@@ -55,6 +64,13 @@ float jointMax[MOTOR_NUM];
 // 360
 float zeroAtPhysical[MOTOR_NUM];
 
+// Encoder-to-motor mapping: absEncoderMotorMap[enc_idx] = motor_idx (0-based),
+// -1 = unmapped
+int8_t absEncoderMotorMap[8]; // supports up to 8 encoders
+bool encoderDetected[8];      // tracks which encoders responded to SPI
+uint8_t encoderRetryCount[8]; // retry counter for failed encoders
+bool absEncoderReversed[8];   // true if encoder reads opposite from motor
+
 struct {
   bool recvMotor = false;
   bool sendMotor = false;
@@ -65,6 +81,7 @@ struct can_frame readMsg = {};
 
 // -------------------- PROTOTYPES --------------------
 void SPIinit();
+void SPI1init();
 void MCPinit();
 void setMotorParam();
 void recvMotor();
@@ -74,6 +91,9 @@ bool sendMotorFlag(struct repeating_timer *t);
 void printHelp();
 void handleSerial();
 void processCommand(String line);
+int16_t readAbsEncoder(uint8_t encoderIndex);
+uint8_t SPIWriteToEncoder(uint8_t encoderIndex, uint8_t sendByte);
+void updateAbsEncoders();
 
 // -------------------- SETUP --------------------
 void setup() {
@@ -81,6 +101,7 @@ void setup() {
   delay(1000);
 
   SPIinit();
+  SPI1init();
   MCPinit();
   setMotorParam();
 
@@ -91,9 +112,21 @@ void setup() {
     zeroAtPhysical[i] = 0.0f; // no offset by default
   }
 
+  // Default encoder-to-motor mapping: encoder 0 -> motor 0, encoder 1 -> motor
+  // 1, etc.
+  for (uint8_t i = 0; i < 8; i++) {
+    absEncoderMotorMap[i] = (i < NUM_ENCODERS) ? (int8_t)i : -1;
+    encoderDetected[i] = false;
+    encoderRetryCount[i] = 0;
+    absEncoderReversed[i] =
+        true; // default: reversed (gearbox output reads opposite)
+  }
+
   mc.setMotor(motor, MOTOR_NUM);
   mc.setPidInterval(&pidInterval);
   mc.init();
+
+  // Don't mark hasAbsEncoder=true yet - set on first successful SPI read
 
   // Timer interrupts
   recvTimer.attachInterruptInterval((uint32_t)(DT_RECV_DATA * 1000000),
@@ -109,22 +142,19 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // Initialize Cytron MD10C Pines
-  pinMode(CYTRON_PWM_PIN, OUTPUT);
-  pinMode(CYTRON_DIR_PIN, OUTPUT);
-#if defined(ARDUINO_ARCH_RP2040) || defined(ARDUINO_ARCH_RP2350)
-  analogWriteFreq(20000);   // 20kHz, eliminates whine
-  analogWriteResolution(8); // 8-bit (0-255)
-#endif
-  digitalWrite(CYTRON_DIR_PIN, LOW);
-  analogWrite(CYTRON_PWM_PIN, 0);
-
   printHelp();
 }
 
 // -------------------- LOOP --------------------
 void loop() {
   handleSerial();
+
+  // Read absolute encoders (~100Hz, time-gated)
+  static uint32_t lastEncRead = 0;
+  if (millis() - lastEncRead > 10) {
+    updateAbsEncoders();
+    lastEncRead = millis();
+  }
 
   // Status Printer: prints any motor with telemetry enabled (via T command) or
   // in ANGLE mode
@@ -134,7 +164,17 @@ void loop() {
     for (int i = 0; i < MOTOR_NUM; i++) {
       if (motor[i].mode == MODE::ANGLE || motorTelemetryEnabled[i]) {
         anyPrinted = true;
-        float physMod = fmod(motor[i].totalAngle, 360.0f);
+
+        // Choose angle source: absolute encoder if available, else motor
+        // encoder
+        float reportAngle;
+        if (motor[i].hasAbsEncoder) {
+          reportAngle = motor[i].absEncoderTotalAngle;
+        } else {
+          reportAngle = motor[i].totalAngle;
+        }
+
+        float physMod = fmod(reportAngle, 360.0f);
         if (physMod < 0)
           physMod += 360.0f;
         // Logical = what P commands use; matches CAL-set zero
@@ -144,10 +184,14 @@ void loop() {
         Serial.print(i + 1);
         Serial.print(" POS:"); // logical degrees (matches P command)
         Serial.print(logicalMod, 1);
-        Serial.print(" PHYS:"); // raw physical encoder reading
+        Serial.print(" PHYS:"); // raw physical reading
         Serial.print(physMod, 1);
+        if (motor[i].hasAbsEncoder) {
+          Serial.print(" APOS:"); // absolute encoder single-rev reading
+          Serial.print(motor[i].absEncoderAngle, 1);
+        }
         Serial.print(" Tot:");
-        Serial.print(motor[i].totalAngle, 1);
+        Serial.print(reportAngle, 1);
         Serial.print(" RPM:");
         Serial.print(motor[i].actualSpeed, 1);
         Serial.print(" A:");
@@ -221,8 +265,14 @@ void printHelp() {
   Serial.println("Gear Ratio:");
   Serial.println("  GEAR <id> <ratio> : Set external gear ratio");
   Serial.println("");
-  Serial.println("Cytron Motor Control (MD10C):");
-  Serial.println("  C <speed>         : Set Cytron speed (-255 to 255)");
+  Serial.println("");
+  Serial.println("Absolute Encoders:");
+  Serial.println(
+      "  ENCSHOW             : Show encoder mappings & raw readings");
+  Serial.println(
+      "  ENCMAP <enc> <motor> : Map encoder index to motor ID (0=unmap)");
+  Serial.println("  ENCZERO <enc>       : Set encoder zero point");
+  Serial.println("  ENCREV <enc>        : Toggle encoder direction");
   Serial.println("");
   Serial.println("S : Stop ALL motors");
   Serial.println("H : Help");
@@ -322,8 +372,6 @@ void processCommand(String line) {
       motor[i].anglePid.integral = 0;
       motor[i].anglePid.prevError = 0;
     }
-    digitalWrite(CYTRON_DIR_PIN, LOW);
-    analogWrite(CYTRON_PWM_PIN, 0);
     Serial.println("STOPPED ALL MOTORS");
     return;
   }
@@ -357,32 +405,6 @@ void processCommand(String line) {
       Serial.print(id);
       Serial.println(motorTelemetryEnabled[id - 1] ? ": ON" : ": OFF");
     }
-    return;
-  }
-
-  // Command: CYTRON MOTOR CONTROL
-  if (line.startsWith("C ")) {
-    int sp1 = line.indexOf(' ');
-    if (sp1 == -1) {
-      Serial.println("Error: Use format 'C <speed>' (-255 to 255)");
-      return;
-    }
-    int speed = line.substring(sp1 + 1).toInt();
-
-    if (speed > 255)
-      speed = 255;
-    if (speed < -255)
-      speed = -255;
-
-    if (speed >= 0) {
-      digitalWrite(CYTRON_DIR_PIN, HIGH);
-      analogWrite(CYTRON_PWM_PIN, speed);
-    } else {
-      digitalWrite(CYTRON_DIR_PIN, LOW);
-      analogWrite(CYTRON_PWM_PIN, -speed);
-    }
-    Serial.print("Cytron Motor -> ");
-    Serial.println(speed);
     return;
   }
 
@@ -651,20 +673,19 @@ void processCommand(String line) {
       motor[i].anglePid.integral = 0;
       motor[i].anglePid.prevError = 0;
 
-      // Use totalAngle (same as the telemetry printer) — NOT actualAngle
-      // which may be the raw motor shaft angle before gear reduction.
-      float physMod = fmod(motor[i].totalAngle, 360.0f);
+      // Use absolute encoder angle if available, motor encoder otherwise
+      float refAngle = motor[i].hasAbsEncoder ? motor[i].absEncoderTotalAngle
+                                              : motor[i].totalAngle;
+      float physMod = fmod(refAngle, 360.0f);
       if (physMod < 0)
         physMod += 360.0f;
-      // zeroAtPhysical: the totalAngle%360 value that maps to logical 0
-      // degrees. E.g., if physMod=90 and calibAngle=0 → offset=90 → future P 0
-      // targets physical 90.
       zeroAtPhysical[i] = fmod(physMod - calibAngle + 360.0f, 360.0f);
 
       Serial.print("M");
       Serial.print(i + 1);
-      Serial.print(" CAL: totalAngle%360=");
+      Serial.print(" CAL: angle%360=");
       Serial.print(physMod);
+      Serial.print(motor[i].hasAbsEncoder ? " (abs)" : " (mot)");
       Serial.print(" -> logical ");
       Serial.print(calibAngle);
       Serial.print(" (offset=");
@@ -696,10 +717,12 @@ void processCommand(String line) {
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
       // Base: use target.angle if already in ANGLE mode (accumulates rapid
-      // presses correctly), otherwise use totalAngle (actual position) to avoid
+      // presses correctly), otherwise use actual position to avoid
       // jumping from a stale target.
-      float base = (motor[i].mode == MODE::ANGLE) ? motor[i].target.angle
-                                                  : motor[i].totalAngle;
+      float base = (motor[i].mode == MODE::ANGLE)
+                       ? motor[i].target.angle
+                       : (motor[i].hasAbsEncoder ? motor[i].absEncoderTotalAngle
+                                                 : motor[i].totalAngle);
       float newTarget = base + delta;
       float newMod = fmod(newTarget, 360.0f);
       if (newMod < 0)
@@ -766,7 +789,9 @@ void processCommand(String line) {
         physDeg = jointMax[i];
 
       // Shortest-path from current position to target
-      float currentTotal = motor[i].totalAngle;
+      float currentTotal = motor[i].hasAbsEncoder
+                               ? motor[i].absEncoderTotalAngle
+                               : motor[i].totalAngle;
       float currentMod = fmod(currentTotal, 360.0f);
       if (currentMod < 0)
         currentMod += 360.0f;
@@ -830,6 +855,117 @@ void processCommand(String line) {
       Serial.print(speed);
       Serial.println(" rpm");
     }
+    return;
+  }
+
+  // Command: ENCODER MAP -> "ENCMAP <enc> <motor>"
+  if (line.startsWith("ENCMAP ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'ENCMAP <enc_idx> <motor_id>'");
+      return;
+    }
+    int encIdx = line.substring(sp1 + 1, sp2).toInt();
+    int motorId = line.substring(sp2 + 1).toInt();
+    if (encIdx < 0 || encIdx >= NUM_ENCODERS) {
+      Serial.print("Error: Encoder index must be 0-");
+      Serial.println(NUM_ENCODERS - 1);
+      return;
+    }
+    if (motorId < 0 || motorId > MOTOR_NUM) {
+      Serial.print("Error: Motor ID must be 0 (unmapped) or 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+    // Clear old mapping
+    int8_t oldMotor = absEncoderMotorMap[encIdx];
+    if (oldMotor >= 0 && oldMotor < MOTOR_NUM)
+      motor[oldMotor].hasAbsEncoder = false;
+    // Set new mapping
+    absEncoderMotorMap[encIdx] = (motorId > 0) ? (int8_t)(motorId - 1) : -1;
+    if (motorId > 0)
+      motor[motorId - 1].hasAbsEncoder = true;
+    Serial.print("Encoder ");
+    Serial.print(encIdx);
+    Serial.print(" -> Motor ");
+    Serial.println(motorId);
+    return;
+  }
+
+  // Command: ENCODER SET ZERO -> "ENCZERO <enc_idx>"
+  if (line.startsWith("ENCZERO ")) {
+    int encIdx = line.substring(8).toInt();
+    if (encIdx < 0 || encIdx >= NUM_ENCODERS) {
+      Serial.print("Error: Encoder index must be 0-");
+      Serial.println(NUM_ENCODERS - 1);
+      return;
+    }
+    // Send set_zero_point command to encoder
+    SPIWriteToEncoder(encIdx, ENC_SET_ZERO);
+    delay(100);
+    // Reset unwrapping state for the mapped motor
+    int8_t mIdx = absEncoderMotorMap[encIdx];
+    if (mIdx >= 0 && mIdx < MOTOR_NUM) {
+      motor[mIdx].absEncoderTotalAngle = 0.0f;
+      motor[mIdx].absEncoderLastRaw = 0;
+      motor[mIdx].absEncoderRoundCount = 0;
+    }
+    Serial.print("Encoder ");
+    Serial.print(encIdx);
+    Serial.println(" zero set");
+    return;
+  }
+
+  // Command: ENCODER SHOW -> "ENCSHOW"
+  if (line == "ENCSHOW") {
+    Serial.println("\n--- Absolute Encoders ---");
+    for (uint8_t e = 0; e < NUM_ENCODERS; e++) {
+      int16_t raw = readAbsEncoder(e);
+      Serial.print("  Enc ");
+      Serial.print(e);
+      Serial.print(" (CS=D");
+      Serial.print(ENC_CS_PINS[e]);
+      Serial.print(") -> Motor ");
+      int8_t mIdx = absEncoderMotorMap[e];
+      if (mIdx >= 0)
+        Serial.print(mIdx + 1);
+      else
+        Serial.print("NONE");
+      Serial.print("  Raw: ");
+      if (raw >= 0) {
+        float deg = 360.0f * ((float)raw / 4096.0f);
+        Serial.print(raw);
+        Serial.print(" (");
+        Serial.print(deg, 1);
+        Serial.print(" deg)");
+      } else {
+        Serial.print("ERROR");
+      }
+      Serial.println();
+    }
+    return;
+  }
+
+  // Command: ENCODER REVERSE -> "ENCREV <enc_idx>"
+  if (line.startsWith("ENCREV ")) {
+    int encIdx = line.substring(7).toInt();
+    if (encIdx < 0 || encIdx >= NUM_ENCODERS) {
+      Serial.print("Error: Encoder index must be 0-");
+      Serial.println(NUM_ENCODERS - 1);
+      return;
+    }
+    absEncoderReversed[encIdx] = !absEncoderReversed[encIdx];
+    // Reset unwrapping so direction change takes effect cleanly
+    int8_t mIdx = absEncoderMotorMap[encIdx];
+    if (mIdx >= 0 && mIdx < MOTOR_NUM) {
+      motor[mIdx].absEncoderTotalAngle = 0.0f;
+      motor[mIdx].absEncoderRoundCount = 0;
+    }
+    Serial.print("Encoder ");
+    Serial.print(encIdx);
+    Serial.print(" direction: ");
+    Serial.println(absEncoderReversed[encIdx] ? "REVERSED" : "NORMAL");
     return;
   }
 
@@ -902,4 +1038,99 @@ bool recvMotorFlag(struct repeating_timer *t) {
 bool sendMotorFlag(struct repeating_timer *t) {
   flag.sendMotor = true;
   return true;
+}
+
+// -------------------- ABSOLUTE ENCODER (SPI1) --------------------
+void SPI1init() {
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    pinMode(ENC_CS_PINS[i], OUTPUT);
+    digitalWrite(ENC_CS_PINS[i], HIGH);
+  }
+  SPI1.setRX(ENC_MISO_PIN);
+  SPI1.setTX(ENC_MOSI_PIN);
+  SPI1.setSCK(ENC_SCK_PIN);
+  SPI1.begin();
+  SPI1.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE1));
+}
+
+uint8_t SPIWriteToEncoder(uint8_t encoderIndex, uint8_t sendByte) {
+  uint8_t csPin = ENC_CS_PINS[encoderIndex];
+  digitalWrite(csPin, LOW);
+  delayMicroseconds(5);
+  uint8_t received = SPI1.transfer(sendByte);
+  digitalWrite(csPin, HIGH);
+  delayMicroseconds(25);
+  return received;
+}
+
+int16_t readAbsEncoder(uint8_t encoderIndex) {
+  uint8_t data;
+  uint8_t timeoutCounter = 0;
+
+  data = SPIWriteToEncoder(encoderIndex, ENC_RD_POS);
+  while (data != ENC_RD_POS && timeoutCounter++ < ENC_TIMEOUT) {
+    data = SPIWriteToEncoder(encoderIndex, ENC_NOP);
+  }
+  if (timeoutCounter >= ENC_TIMEOUT) {
+    return -1;
+  }
+  uint16_t pos = (SPIWriteToEncoder(encoderIndex, ENC_NOP) & 0x0F) << 8;
+  pos |= SPIWriteToEncoder(encoderIndex, ENC_NOP);
+  return (int16_t)pos;
+}
+
+void updateAbsEncoders() {
+  for (uint8_t e = 0; e < NUM_ENCODERS; e++) {
+    int8_t mIdx = absEncoderMotorMap[e];
+    if (mIdx < 0 || mIdx >= MOTOR_NUM)
+      continue;
+
+    // Skip encoders that failed detection — retry every ~256 cycles (~2.5s)
+    if (!encoderDetected[e]) {
+      encoderRetryCount[e]++;
+      if (encoderRetryCount[e] != 0) // only retry when counter wraps to 0
+        continue;
+    }
+
+    int16_t raw = readAbsEncoder(e);
+    if (raw < 0) {
+      if (encoderDetected[e]) {
+        // Was working, now failed — don't immediately disable
+      }
+      continue; // read error, skip
+    }
+
+    // First successful read — mark encoder as detected and motor as having abs
+    // encoder
+    if (!encoderDetected[e]) {
+      encoderDetected[e] = true;
+      motor[mIdx].hasAbsEncoder = true;
+      motor[mIdx].absEncoderLastRaw = (uint16_t)raw; // seed unwrapping
+      Serial.print("Abs encoder ");
+      Serial.print(e);
+      Serial.print(" detected -> Motor ");
+      Serial.println(mIdx + 1);
+    }
+
+    // Update single-revolution angle
+    motor[mIdx].absEncoderAngle = 360.0f * ((float)raw / 4096.0f);
+
+    // Angle unwrapping (12-bit, 0-4095)
+    int32_t diff = (int32_t)raw - (int32_t)motor[mIdx].absEncoderLastRaw;
+    if (diff < -2048)
+      motor[mIdx].absEncoderRoundCount++;
+    else if (diff > 2048)
+      motor[mIdx].absEncoderRoundCount--;
+    motor[mIdx].absEncoderLastRaw = (uint16_t)raw;
+
+    motor[mIdx].absEncoderTotalAngle =
+        (motor[mIdx].absEncoderRoundCount * 360.0f) +
+        (360.0f * ((float)raw / 4096.0f));
+
+    // Apply direction reversal if needed
+    if (absEncoderReversed[e]) {
+      motor[mIdx].absEncoderAngle = 360.0f - motor[mIdx].absEncoderAngle;
+      motor[mIdx].absEncoderTotalAngle = -motor[mIdx].absEncoderTotalAngle;
+    }
+  }
 }

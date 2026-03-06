@@ -23,6 +23,12 @@ void motorControl::init() {
     motors[i].speedPid.integral = 0;
     motors[i].anglePid.prevError = 0;
     motors[i].anglePid.integral = 0;
+    // Absolute encoder fields (populated externally by goo.ino)
+    motors[i].hasAbsEncoder = false;
+    motors[i].absEncoderAngle = 0.0f;
+    motors[i].absEncoderTotalAngle = 0.0f;
+    motors[i].absEncoderLastRaw = 0;
+    motors[i].absEncoderRoundCount = 0;
   }
 }
 
@@ -98,7 +104,10 @@ void motorControl::updateMotorCommand(struct can_frame *sendMsg,
     currentCmd = calculatePID(&m->speedPid, error, dt);
   } else if (m->mode == MODE::ANGLE) {
     // Cascade: Position Loop -> Speed Loop
-    float posError = m->target.angle - m->totalAngle;
+    // Use absolute encoder angle when available, motor encoder otherwise
+    float currentAngle =
+        m->hasAbsEncoder ? m->absEncoderTotalAngle : m->totalAngle;
+    float posError = m->target.angle - currentAngle;
     float targetSpeed = calculatePID(&m->anglePid, posError, dt);
     float speedError = targetSpeed - m->actualSpeed;
     currentCmd = calculatePID(&m->speedPid, speedError, dt);
