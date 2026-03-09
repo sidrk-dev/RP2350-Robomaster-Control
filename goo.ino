@@ -31,7 +31,7 @@
 const uint8_t ENC_CS_PINS[] = {D3, D4};
 const uint8_t NUM_ENCODERS = sizeof(ENC_CS_PINS) / sizeof(ENC_CS_PINS[0]);
 
-#define M2006_GEAR_RATIO 19.0
+#define M2006_GEAR_RATIO 36.0
 #define M3508_GEAR_RATIO 19.0
 
 // Supports IDs 1 through 8
@@ -52,17 +52,21 @@ pidInterval_t pidInterval = {8, 4, 2};
 bool motorTelemetryEnabled[MOTOR_NUM] =
     {}; // per-motor telemetry toggle (T command)
 
-// Per-joint physical limits (degrees). Enforced in P and PR commands.
+// Per-joint logical limits (degrees). Enforced in P and PR commands.
 // Defaults: 0 to 360 (full rotation). Set via JLIM command.
 float jointMin[MOTOR_NUM];
 float jointMax[MOTOR_NUM];
 
-// Per-joint position offset (degrees, 0-360).
-// zeroAtPhysical[i] = the physical encoder reading (mod 360) that
-// corresponds to logical 0 degrees. Set by the CAL command.
-// P command converts: physicalTarget = (logicalTarget + zeroAtPhysical[i]) %
-// 360
+// Per-joint wrapped physical offset (degrees, 0-360) used only for
+// diagnostics/telemetry after CAL. Closed-loop control uses zeroAtControlTotal.
 float zeroAtPhysical[MOTOR_NUM];
+
+// Per-joint logical zero in the same total-angle frame used by PID.
+// logicalAngle = controlTotalAngle - zeroAtControlTotal.
+float zeroAtControlTotal[MOTOR_NUM];
+
+// Open-loop velocity feedforward gain (A per RPM), used by MV command.
+float mvGainAperRpm[MOTOR_NUM];
 
 // Encoder-to-motor mapping: absEncoderMotorMap[enc_idx] = motor_idx (0-based),
 // -1 = unmapped
@@ -94,6 +98,15 @@ void processCommand(String line);
 int16_t readAbsEncoder(uint8_t encoderIndex);
 uint8_t SPIWriteToEncoder(uint8_t encoderIndex, uint8_t sendByte);
 void updateAbsEncoders();
+static float getControlTotalAngle(uint8_t motorIndex);
+static float getControlLogicalAngle(uint8_t motorIndex);
+static bool isJointFullRange(uint8_t motorIndex);
+static int8_t findMappedEncoderForMotor(uint8_t motorIndex);
+static float projectLogicalTargetToLimits(uint8_t motorIndex, float targetDeg,
+                                          float referenceDeg);
+static void clampActiveAngleTargetToLimits(uint8_t motorIndex);
+static void fallbackMotorToInternalEncoder(uint8_t motorIndex);
+static void resetAbsStateForMotor(uint8_t motorIndex);
 
 // -------------------- SETUP --------------------
 void setup() {
@@ -110,6 +123,8 @@ void setup() {
     jointMin[i] = 0.0f;
     jointMax[i] = 360.0f;
     zeroAtPhysical[i] = 0.0f; // no offset by default
+    zeroAtControlTotal[i] = 0.0f;
+    mvGainAperRpm[i] = 0.02f; // default open-loop map: 100 RPM -> 2.0 A
   }
 
   // Default encoder-to-motor mapping: encoder 0 -> motor 0, encoder 1 -> motor
@@ -125,6 +140,12 @@ void setup() {
   mc.setMotor(motor, MOTOR_NUM);
   mc.setPidInterval(&pidInterval);
   mc.init();
+
+  // Use motor internal encoder for closed-loop control by default.
+  // Absolute encoders remain available for APOS telemetry/debug.
+  for (int i = 0; i < MOTOR_NUM; i++) {
+    motor[i].useAbsEncoderForPID = false;
+  }
 
   // Don't mark hasAbsEncoder=true yet - set on first successful SPI read
 
@@ -165,25 +186,21 @@ void loop() {
       if (motor[i].mode == MODE::ANGLE || motorTelemetryEnabled[i]) {
         anyPrinted = true;
 
-        // Choose angle source: absolute encoder if available, else motor
-        // encoder
-        float reportAngle;
-        if (motor[i].hasAbsEncoder) {
-          reportAngle = motor[i].absEncoderTotalAngle;
-        } else {
-          reportAngle = motor[i].totalAngle;
-        }
+        // Choose control angle source used by closed-loop logic.
+        float reportAngle = getControlTotalAngle(i);
+        float logicalNow = getControlLogicalAngle(i);
+        float rangeWidth = jointMax[i] - jointMin[i];
+        float logicalDisplay =
+            (rangeWidth >= 359.5f) ? wrap360f(logicalNow) : logicalNow;
 
         float physMod = fmod(reportAngle, 360.0f);
         if (physMod < 0)
           physMod += 360.0f;
-        // Logical = what P commands use; matches CAL-set zero
-        float logicalMod = fmod(physMod - zeroAtPhysical[i] + 360.0f, 360.0f);
 
         Serial.print("M");
         Serial.print(i + 1);
         Serial.print(" POS:"); // logical degrees (matches P command)
-        Serial.print(logicalMod, 1);
+        Serial.print(logicalDisplay, 1);
         Serial.print(" PHYS:"); // raw physical reading
         Serial.print(physMod, 1);
         if (motor[i].hasAbsEncoder) {
@@ -226,13 +243,15 @@ void printHelp() {
                  "for batching.");
   Serial.println("");
   Serial.println("Position Control:");
-  Serial.println("  P <id> <angle>    : Move to absolute angle (0-360)");
+  Serial.println("  P <id> <angle>    : Move to absolute logical angle");
   Serial.println(
       "  PR <id> <delta>   : Move RELATIVE delta degrees from current");
   Serial.println("  Example: P 1 90 | P * 0 | PR 2 -45");
   Serial.println("");
   Serial.println("Speed Control:");
   Serial.println("  M <id> <speed>    : Set speed in RPM (continuous)");
+  Serial.println("  MV <id> <speed>   : Open-loop velocity (bypass Speed PID)");
+  Serial.println("  MVG <id> <gain>   : Set MV gain (A per RPM)");
   Serial.println("  Example: M 1 500 | M * -300");
   Serial.println("");
   Serial.println("PID Tuning (full):");
@@ -258,9 +277,9 @@ void printHelp() {
   Serial.println("");
   Serial.println("Joint Limits:");
   Serial.println(
-      "  JLIM <id|*> <min> <max> : Set physical angle limits (degrees)");
+      "  JLIM <id|*> <min> <max> : Set logical joint limits (degrees)");
   Serial.println(
-      "  Example: JLIM 1 0 270   : Joint 1 can only go 0-270 degrees");
+      "  Example: JLIM 1 -90 90  : Joint 1 can only go -90 to +90 degrees");
   Serial.println("");
   Serial.println("Gear Ratio:");
   Serial.println("  GEAR <id> <ratio> : Set external gear ratio");
@@ -271,6 +290,8 @@ void printHelp() {
       "  ENCSHOW             : Show encoder mappings & raw readings");
   Serial.println(
       "  ENCMAP <enc> <motor> : Map encoder index to motor ID (0=unmap)");
+  Serial.println(
+      "  ABSPID <id|*> <0|1>  : Use mapped abs encoder for PID (safe sync)");
   Serial.println("  ENCZERO <enc>       : Set encoder zero point");
   Serial.println("  ENCREV <enc>        : Toggle encoder direction");
   Serial.println("");
@@ -305,6 +326,120 @@ void handleSerial() {
 
 // Resolves a motor ID string: returns -1 for wildcard *, else the 1-based int
 // Sets isWildcard true when * is used
+static float wrap360f(float angle) {
+  while (angle >= 360.0f)
+    angle -= 360.0f;
+  while (angle < 0.0f)
+    angle += 360.0f;
+  return angle;
+}
+
+static float clampf(float v, float lo, float hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+// Return the wrapped equivalent of angleDeg that is closest to referenceDeg.
+static float nearestEquivalent(float angleDeg, float referenceDeg) {
+  float turns = roundf((referenceDeg - angleDeg) / 360.0f);
+  return angleDeg + (turns * 360.0f);
+}
+
+static float getControlTotalAngle(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return 0.0f;
+  if (motor[motorIndex].hasAbsEncoder &&
+      motor[motorIndex].useAbsEncoderForPID) {
+    return motor[motorIndex].absEncoderTotalAngle;
+  }
+  return motor[motorIndex].totalAngle;
+}
+
+static float getControlLogicalAngle(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return 0.0f;
+  return getControlTotalAngle(motorIndex) - zeroAtControlTotal[motorIndex];
+}
+
+static bool isJointFullRange(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return true;
+  return (jointMax[motorIndex] - jointMin[motorIndex]) >= 359.5f;
+}
+
+static int8_t findMappedEncoderForMotor(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return -1;
+  for (uint8_t e = 0; e < NUM_ENCODERS; e++) {
+    if (absEncoderMotorMap[e] == (int8_t)motorIndex)
+      return (int8_t)e;
+  }
+  return -1;
+}
+
+static float projectLogicalTargetToLimits(uint8_t motorIndex, float targetDeg,
+                                          float referenceDeg) {
+  if (motorIndex >= MOTOR_NUM)
+    return targetDeg;
+  if (isJointFullRange(motorIndex)) {
+    return nearestEquivalent(targetDeg, referenceDeg);
+  }
+  referenceDeg = clampf(referenceDeg, jointMin[motorIndex], jointMax[motorIndex]);
+  if (targetDeg >= jointMin[motorIndex] && targetDeg <= jointMax[motorIndex]) {
+    return targetDeg;
+  }
+  return clampf(nearestEquivalent(targetDeg, referenceDeg),
+                jointMin[motorIndex], jointMax[motorIndex]);
+}
+
+static void clampActiveAngleTargetToLimits(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM || motor[motorIndex].mode != MODE::ANGLE)
+    return;
+  if (isJointFullRange(motorIndex))
+    return;
+
+  float currentLogical = getControlLogicalAngle(motorIndex);
+  float targetLogical =
+      motor[motorIndex].target.angle - zeroAtControlTotal[motorIndex];
+  float clampedLogical =
+      projectLogicalTargetToLimits(motorIndex, targetLogical, currentLogical);
+  motor[motorIndex].target.angle =
+      zeroAtControlTotal[motorIndex] + clampedLogical;
+  motor[motorIndex].anglePid.integral = 0.0f;
+  motor[motorIndex].anglePid.prevError = 0.0f;
+}
+
+static void fallbackMotorToInternalEncoder(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return;
+  float previousLogical = getControlLogicalAngle(motorIndex);
+  float previousTargetLogical =
+      motor[motorIndex].target.angle - zeroAtControlTotal[motorIndex];
+  zeroAtControlTotal[motorIndex] = motor[motorIndex].totalAngle - previousLogical;
+  motor[motorIndex].useAbsEncoderForPID = false;
+  if (motor[motorIndex].mode == MODE::ANGLE) {
+    motor[motorIndex].target.angle =
+        zeroAtControlTotal[motorIndex] + previousTargetLogical;
+    clampActiveAngleTargetToLimits(motorIndex);
+  }
+  motor[motorIndex].anglePid.integral = 0.0f;
+  motor[motorIndex].anglePid.prevError = 0.0f;
+}
+
+static void resetAbsStateForMotor(uint8_t motorIndex) {
+  if (motorIndex >= MOTOR_NUM)
+    return;
+  motor[motorIndex].absEncoderAngle = 0.0f;
+  motor[motorIndex].absEncoderTotalAngle = 0.0f;
+  motor[motorIndex].absEncoderLastRaw = 0;
+  motor[motorIndex].absEncoderRoundCount = 0;
+  motor[motorIndex].hasAbsEncoder = false;
+  motor[motorIndex].useAbsEncoderForPID = false;
+}
+
 static void dispatchMotorIDs(String idStr, bool &isWildcard, int &singleId) {
   if (idStr == "*") {
     isWildcard = true;
@@ -364,8 +499,9 @@ void processCommand(String line) {
   // Command: STOP ALL
   if (line == "S") {
     for (int i = 0; i < MOTOR_NUM; i++) {
-      motor[i].mode = MODE::SPEED;
+      motor[i].mode = MODE::SLEEP;
       motor[i].target.speed = 0.0f;
+      motor[i].target.current = 0.0f;
       // Reset PID state to prevent integral windup from keeping motors moving
       motor[i].speedPid.integral = 0;
       motor[i].speedPid.prevError = 0;
@@ -586,11 +722,19 @@ void processCommand(String line) {
     int startM = isWild ? 0 : singleId - 1;
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
-      motor[i].externalGearRatio = ratio;
+      // Backward compatibility: If ratio is large and motor has an internal
+      // gearbox (like M2006/M3508), the user/GUI likely sent the TOTAL gear
+      // ratio instead of just the external ratio.
+      if (ratio > 10.0f && motor[i].gearRatio > 1.0f) {
+        motor[i].externalGearRatio = ratio / motor[i].gearRatio;
+      } else {
+        motor[i].externalGearRatio = ratio;
+      }
+
       Serial.print("Motor ");
       Serial.print(i + 1);
       Serial.print(" gear ratio: ");
-      Serial.print(ratio);
+      Serial.print(motor[i].externalGearRatio);
       Serial.print(":1 (Total: ");
       Serial.print(motor[i].gearRatio * motor[i].externalGearRatio);
       Serial.println(":1)");
@@ -627,13 +771,19 @@ void processCommand(String line) {
     for (int i = startM; i <= endM; i++) {
       jointMin[i] = minA;
       jointMax[i] = maxA;
+      clampActiveAngleTargetToLimits(i);
       Serial.print("M");
       Serial.print(i + 1);
-      Serial.print(" limits: [");
+      Serial.print(" logical limits: [");
       Serial.print(minA);
       Serial.print(", ");
       Serial.print(maxA);
-      Serial.println("]");
+      Serial.print("]");
+      if (motor[i].mode == MODE::ANGLE) {
+        Serial.print(" target=");
+        Serial.print(motor[i].target.angle - zeroAtControlTotal[i]);
+      }
+      Serial.println();
     }
     return;
   }
@@ -658,10 +808,7 @@ void processCommand(String line) {
       Serial.println(MOTOR_NUM);
       return;
     }
-    while (calibAngle >= 360.0)
-      calibAngle -= 360.0;
-    while (calibAngle < 0.0)
-      calibAngle += 360.0;
+    float calibAngleWrapped = wrap360f(calibAngle);
 
     int startM = isWild ? 0 : singleId - 1;
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
@@ -673,13 +820,13 @@ void processCommand(String line) {
       motor[i].anglePid.integral = 0;
       motor[i].anglePid.prevError = 0;
 
-      // Use absolute encoder angle if available, motor encoder otherwise
-      float refAngle = motor[i].hasAbsEncoder ? motor[i].absEncoderTotalAngle
-                                              : motor[i].totalAngle;
+      // Use the same reference as closed-loop control.
+      float refAngle = getControlTotalAngle(i);
       float physMod = fmod(refAngle, 360.0f);
       if (physMod < 0)
         physMod += 360.0f;
-      zeroAtPhysical[i] = fmod(physMod - calibAngle + 360.0f, 360.0f);
+      zeroAtPhysical[i] = fmod(physMod - calibAngleWrapped + 360.0f, 360.0f);
+      zeroAtControlTotal[i] = refAngle - calibAngle;
 
       Serial.print("M");
       Serial.print(i + 1);
@@ -690,6 +837,8 @@ void processCommand(String line) {
       Serial.print(calibAngle);
       Serial.print(" (offset=");
       Serial.print(zeroAtPhysical[i]);
+      Serial.print(", totalZero=");
+      Serial.print(zeroAtControlTotal[i]);
       Serial.println(")");
     }
     return;
@@ -716,35 +865,20 @@ void processCommand(String line) {
     int startM = isWild ? 0 : singleId - 1;
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
-      // Base: use target.angle if already in ANGLE mode (accumulates rapid
-      // presses correctly), otherwise use actual position to avoid
-      // jumping from a stale target.
-      float base = (motor[i].mode == MODE::ANGLE)
-                       ? motor[i].target.angle
-                       : (motor[i].hasAbsEncoder ? motor[i].absEncoderTotalAngle
-                                                 : motor[i].totalAngle);
-      float newTarget = base + delta;
-      float newMod = fmod(newTarget, 360.0f);
-      if (newMod < 0)
-        newMod += 360.0f;
-
-      // Clamp to physical limits (stop at boundary, never reject)
-      if (newMod < jointMin[i])
-        newTarget += (jointMin[i] - newMod);
-      else if (newMod > jointMax[i])
-        newTarget -= (newMod - jointMax[i]);
+      float currentLogical = getControlLogicalAngle(i);
+      float desiredLogical = projectLogicalTargetToLimits(
+          i, currentLogical + delta, currentLogical);
 
       motor[i].mode = MODE::ANGLE;
-      motor[i].target.angle = newTarget;
-      float finalMod = fmod(newTarget, 360.0f);
-      if (finalMod < 0)
-        finalMod += 360.0f;
+      motor[i].target.angle = zeroAtControlTotal[i] + desiredLogical;
+      motor[i].anglePid.integral = 0.0f;
+      motor[i].anglePid.prevError = 0.0f;
       Serial.print("M");
       Serial.print(i + 1);
       Serial.print(" PR ");
       Serial.print(delta);
-      Serial.print(" -> ");
-      Serial.println(finalMod);
+      Serial.print(" -> log ");
+      Serial.println(desiredLogical);
     }
     return;
   }
@@ -777,43 +911,108 @@ void processCommand(String line) {
     int startM = isWild ? 0 : singleId - 1;
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
-      // Convert logical -> physical via zero offset
-      float physDeg = fmod(targetDeg + zeroAtPhysical[i], 360.0f);
-      if (physDeg < 0)
-        physDeg += 360.0f;
-
-      // Per-motor clamping to physical limits
-      if (physDeg < jointMin[i])
-        physDeg = jointMin[i];
-      if (physDeg > jointMax[i])
-        physDeg = jointMax[i];
-
-      // Shortest-path from current position to target
-      float currentTotal = motor[i].hasAbsEncoder
-                               ? motor[i].absEncoderTotalAngle
-                               : motor[i].totalAngle;
-      float currentMod = fmod(currentTotal, 360.0f);
-      if (currentMod < 0)
-        currentMod += 360.0f;
-      float error = physDeg - currentMod;
-      if (error > 180.0f)
-        error -= 360.0f;
-      if (error < -180.0f)
-        error += 360.0f;
+      float currentLogical = getControlLogicalAngle(i);
+      float desiredLogical =
+          projectLogicalTargetToLimits(i, targetDeg, currentLogical);
+      float error = desiredLogical - currentLogical;
 
       motor[i].mode = MODE::ANGLE;
-      motor[i].target.angle = currentTotal + error;
+      motor[i].target.angle = zeroAtControlTotal[i] + desiredLogical;
       // Reset angle PID to prevent stale integral from fighting the new target
       motor[i].anglePid.integral = 0;
       motor[i].anglePid.prevError = 0;
 
       Serial.print("M");
       Serial.print(i + 1);
-      Serial.print(" -> phys ");
-      Serial.print(physDeg);
+      Serial.print(" -> log ");
+      Serial.print(desiredLogical);
       Serial.print(" (err=");
       Serial.print(error);
       Serial.println(")");
+    }
+    return;
+  }
+
+  // Command: SPEED CONTROL -> "M <id|*> <speed>"
+  if (line.startsWith("MVG ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'MVG <id|*> <gain>'");
+      return;
+    }
+    String idStr = line.substring(sp1 + 1, sp2);
+    float gain = line.substring(sp2 + 1).toFloat();
+    if (gain <= 0.0f) {
+      Serial.println("Error: gain must be > 0");
+      return;
+    }
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+      Serial.print("Error: ID must be 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      mvGainAperRpm[i] = gain;
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" MV gain: ");
+      Serial.print(gain, 4);
+      Serial.println(" A/RPM");
+    }
+    return;
+  }
+
+  // Command: OPEN-LOOP VELOCITY -> "MV <id|*> <speed>"
+  if (line.startsWith("MV ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'MV <id|*> <speed>'");
+      return;
+    }
+
+    String idStr = line.substring(sp1 + 1, sp2);
+    float speed = line.substring(sp2 + 1).toFloat();
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+      Serial.print("Error: ID must be 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      float currentFF = speed * mvGainAperRpm[i];
+      if (currentFF > 20.0f)
+        currentFF = 20.0f;
+      if (currentFF < -20.0f)
+        currentFF = -20.0f;
+      if (fabsf(speed) < 0.5f)
+        currentFF = 0.0f;
+
+      motor[i].mode = MODE::CURRENT;
+      motor[i].target.current = currentFF;
+      motor[i].speedPid.integral = 0.0f;
+      motor[i].speedPid.prevError = 0.0f;
+      motor[i].anglePid.integral = 0.0f;
+      motor[i].anglePid.prevError = 0.0f;
+
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" MV ");
+      Serial.print(speed, 1);
+      Serial.print(" rpm -> ");
+      Serial.print(currentFF, 2);
+      Serial.println(" A (open-loop)");
     }
     return;
   }
@@ -841,19 +1040,27 @@ void processCommand(String line) {
     int startM = isWild ? 0 : singleId - 1;
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
-      motor[i].mode = MODE::SPEED;
-      motor[i].target.speed = speed;
-      // Reset PID state when stopping to prevent integral windup from fighting
-      // the stop
       if (fabsf(speed) < 1.0f) {
+        motor[i].mode = MODE::SLEEP;
+        motor[i].target.speed = 0.0f;
+        motor[i].target.current = 0.0f;
         motor[i].speedPid.integral = 0;
         motor[i].speedPid.prevError = 0;
+        motor[i].anglePid.integral = 0;
+        motor[i].anglePid.prevError = 0;
+      } else {
+        motor[i].mode = MODE::SPEED;
+        motor[i].target.speed = speed;
       }
       Serial.print("M");
       Serial.print(i + 1);
       Serial.print(" -> ");
-      Serial.print(speed);
-      Serial.println(" rpm");
+      if (fabsf(speed) < 1.0f) {
+        Serial.println("SLEEP");
+      } else {
+        Serial.print(speed);
+        Serial.println(" rpm");
+      }
     }
     return;
   }
@@ -880,16 +1087,89 @@ void processCommand(String line) {
     }
     // Clear old mapping
     int8_t oldMotor = absEncoderMotorMap[encIdx];
-    if (oldMotor >= 0 && oldMotor < MOTOR_NUM)
-      motor[oldMotor].hasAbsEncoder = false;
+    if (oldMotor >= 0 && oldMotor < MOTOR_NUM) {
+      fallbackMotorToInternalEncoder(oldMotor);
+      resetAbsStateForMotor(oldMotor);
+    }
     // Set new mapping
     absEncoderMotorMap[encIdx] = (motorId > 0) ? (int8_t)(motorId - 1) : -1;
-    if (motorId > 0)
-      motor[motorId - 1].hasAbsEncoder = true;
+    encoderDetected[encIdx] = false;
+    encoderRetryCount[encIdx] = 0;
+    if (motorId > 0) {
+      resetAbsStateForMotor(motorId - 1); // wait for first valid read
+    }
     Serial.print("Encoder ");
     Serial.print(encIdx);
     Serial.print(" -> Motor ");
     Serial.println(motorId);
+    return;
+  }
+
+  // Command: SELECT PID FEEDBACK SOURCE -> "ABSPID <id|*> <0|1>"
+  if (line.startsWith("ABSPID ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'ABSPID <id|*> <0|1>'");
+      return;
+    }
+    String idStr = line.substring(sp1 + 1, sp2);
+    int enable = line.substring(sp2 + 1).toInt();
+    if (!(enable == 0 || enable == 1)) {
+      Serial.println("Error: ABSPID value must be 0 or 1");
+      return;
+    }
+    bool isWild;
+    int singleId;
+    dispatchMotorIDs(idStr, isWild, singleId);
+    if (!isWild && (singleId < 1 || singleId > MOTOR_NUM)) {
+      Serial.print("Error: ID must be 1-");
+      Serial.println(MOTOR_NUM);
+      return;
+    }
+
+    int startM = isWild ? 0 : singleId - 1;
+    int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
+    for (int i = startM; i <= endM; i++) {
+      float previousLogical = getControlLogicalAngle(i);
+      float previousTargetLogical = motor[i].target.angle - zeroAtControlTotal[i];
+
+      if (enable == 1) {
+        int8_t encIdx = findMappedEncoderForMotor(i);
+        if (encIdx < 0) {
+          Serial.print("M");
+          Serial.print(i + 1);
+          Serial.println(" ABSPID skipped: no encoder mapped");
+          continue;
+        }
+        if (!motor[i].hasAbsEncoder || !encoderDetected[encIdx]) {
+          Serial.print("M");
+          Serial.print(i + 1);
+          Serial.println(" ABSPID skipped: encoder not detected yet");
+          continue;
+        }
+
+        zeroAtControlTotal[i] = motor[i].absEncoderTotalAngle - previousLogical;
+        motor[i].useAbsEncoderForPID = true;
+      } else {
+        zeroAtControlTotal[i] = motor[i].totalAngle - previousLogical;
+        motor[i].useAbsEncoderForPID = false;
+      }
+
+      if (motor[i].mode == MODE::ANGLE) {
+        motor[i].target.angle = zeroAtControlTotal[i] + previousTargetLogical;
+        clampActiveAngleTargetToLimits(i);
+      }
+      motor[i].anglePid.integral = 0.0f;
+      motor[i].anglePid.prevError = 0.0f;
+
+      Serial.print("M");
+      Serial.print(i + 1);
+      Serial.print(" PID source: ");
+      Serial.print(motor[i].useAbsEncoderForPID ? "ABS" : "MOTOR");
+      Serial.print(" logical=");
+      Serial.println(getControlLogicalAngle(i));
+    }
     return;
   }
 
@@ -907,9 +1187,10 @@ void processCommand(String line) {
     // Reset unwrapping state for the mapped motor
     int8_t mIdx = absEncoderMotorMap[encIdx];
     if (mIdx >= 0 && mIdx < MOTOR_NUM) {
-      motor[mIdx].absEncoderTotalAngle = 0.0f;
-      motor[mIdx].absEncoderLastRaw = 0;
-      motor[mIdx].absEncoderRoundCount = 0;
+      fallbackMotorToInternalEncoder(mIdx);
+      resetAbsStateForMotor(mIdx);
+      encoderDetected[encIdx] = false;
+      encoderRetryCount[encIdx] = 0;
     }
     Serial.print("Encoder ");
     Serial.print(encIdx);
@@ -959,8 +1240,10 @@ void processCommand(String line) {
     // Reset unwrapping so direction change takes effect cleanly
     int8_t mIdx = absEncoderMotorMap[encIdx];
     if (mIdx >= 0 && mIdx < MOTOR_NUM) {
-      motor[mIdx].absEncoderTotalAngle = 0.0f;
-      motor[mIdx].absEncoderRoundCount = 0;
+      fallbackMotorToInternalEncoder(mIdx);
+      resetAbsStateForMotor(mIdx);
+      encoderDetected[encIdx] = false;
+      encoderRetryCount[encIdx] = 0;
     }
     Serial.print("Encoder ");
     Serial.print(encIdx);
@@ -1009,8 +1292,7 @@ void setMotorParam() {
   }
 
   // Special tuning for Motor 1 if it's an M3508
-  // Uncomment if Motor 1 is M3508:
-  // motor[0].gearRatio = M3508_GEAR_RATIO;
+  motor[0].gearRatio = M3508_GEAR_RATIO;
 }
 
 // -------------------- CAN TASKS --------------------
@@ -1022,6 +1304,8 @@ void recvMotor() {
 }
 
 void sendMotor() {
+  // Keep command outputs fresh even if feedback frames pause.
+  mc.refresh(micros(), sendMsg, nullptr);
   mcp.sendMessage(&sendMsg[0]); // ID 1-4
   if (MOTOR_NUM > 4) {
     mcp.sendMessage(&sendMsg[1]); // ID 5-8
@@ -1085,52 +1369,51 @@ void updateAbsEncoders() {
     if (mIdx < 0 || mIdx >= MOTOR_NUM)
       continue;
 
-    // Skip encoders that failed detection — retry every ~256 cycles (~2.5s)
-    if (!encoderDetected[e]) {
-      encoderRetryCount[e]++;
-      if (encoderRetryCount[e] != 0) // only retry when counter wraps to 0
-        continue;
-    }
-
+    float previousLogical = getControlLogicalAngle(mIdx);
+    float previousTargetLogical =
+        motor[mIdx].target.angle - zeroAtControlTotal[mIdx];
+    bool firstDetect = !encoderDetected[e];
     int16_t raw = readAbsEncoder(e);
     if (raw < 0) {
-      if (encoderDetected[e]) {
-        // Was working, now failed — don't immediately disable
-      }
-      continue; // read error, skip
+      encoderRetryCount[e]++;
+      continue;
     }
+    encoderRetryCount[e] = 0;
 
-    // First successful read — mark encoder as detected and motor as having abs
-    // encoder
-    if (!encoderDetected[e]) {
-      encoderDetected[e] = true;
-      motor[mIdx].hasAbsEncoder = true;
-      motor[mIdx].absEncoderLastRaw = (uint16_t)raw; // seed unwrapping
-      Serial.print("Abs encoder ");
-      Serial.print(e);
-      Serial.print(" detected -> Motor ");
-      Serial.println(mIdx + 1);
-    }
-
-    // Update single-revolution angle
     motor[mIdx].absEncoderAngle = 360.0f * ((float)raw / 4096.0f);
 
-    // Angle unwrapping (12-bit, 0-4095)
-    int32_t diff = (int32_t)raw - (int32_t)motor[mIdx].absEncoderLastRaw;
-    if (diff < -2048)
-      motor[mIdx].absEncoderRoundCount++;
-    else if (diff > 2048)
-      motor[mIdx].absEncoderRoundCount--;
+    if (firstDetect) {
+      motor[mIdx].absEncoderLastRaw = (uint16_t)raw;
+      motor[mIdx].absEncoderRoundCount = 0;
+    } else {
+      int32_t diff = (int32_t)raw - (int32_t)motor[mIdx].absEncoderLastRaw;
+      if (diff < -2048)
+        motor[mIdx].absEncoderRoundCount++;
+      else if (diff > 2048)
+        motor[mIdx].absEncoderRoundCount--;
+    }
     motor[mIdx].absEncoderLastRaw = (uint16_t)raw;
 
     motor[mIdx].absEncoderTotalAngle =
         (motor[mIdx].absEncoderRoundCount * 360.0f) +
         (360.0f * ((float)raw / 4096.0f));
 
-    // Apply direction reversal if needed
     if (absEncoderReversed[e]) {
       motor[mIdx].absEncoderAngle = 360.0f - motor[mIdx].absEncoderAngle;
       motor[mIdx].absEncoderTotalAngle = -motor[mIdx].absEncoderTotalAngle;
+    }
+
+    if (firstDetect) {
+      encoderDetected[e] = true;
+      motor[mIdx].hasAbsEncoder = true;
+      motor[mIdx].useAbsEncoderForPID = false;
+      Serial.print("Abs encoder ");
+      Serial.print(e);
+      Serial.print(" detected -> Motor ");
+      Serial.print(mIdx + 1);
+      Serial.println(" (telemetry only)");
+    } else {
+      motor[mIdx].hasAbsEncoder = true;
     }
   }
 }

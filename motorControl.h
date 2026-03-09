@@ -57,10 +57,12 @@ typedef struct {
   int32_t roundCount;    // Number of complete rotations
 
   // Absolute encoder (AMT203S on SPI1, mounted on gearbox output)
-  bool hasAbsEncoder;           // true if an absolute encoder is mapped
-  float absEncoderAngle;        // Latest single-revolution reading (0-360°)
-  float absEncoderTotalAngle;   // Unwrapped accumulated angle (degrees)
-  uint16_t absEncoderLastRaw;   // Last raw value for unwrapping (0-4095)
+  bool hasAbsEncoder;         // true if an absolute encoder is mapped
+  bool useAbsEncoderForPID;   // true to close PID loop with abs encoder, false
+                              // for telemetry only
+  float absEncoderAngle;      // Latest single-revolution reading (0-360°)
+  float absEncoderTotalAngle; // Unwrapped accumulated angle (degrees)
+  uint16_t absEncoderLastRaw; // Last raw value for unwrapping (0-4095)
   int32_t absEncoderRoundCount; // Revolution counter for unwrapping
 } motor_t;
 
@@ -81,7 +83,8 @@ private:
 
   // Internal PID calculation functions
   float calculatePID(pid_params_t *pid, float error, float dt);
-  void updateMotorCommand(struct can_frame *sendMsg, uint8_t motorIndex);
+  void updateMotorCommand(struct can_frame *sendMsg, uint8_t motorIndex,
+                          float dt);
   void parseMotorFeedback(struct can_frame *readMsg);
 
 public:

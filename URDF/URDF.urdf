@@ -163,7 +163,7 @@
   <origin xyz="0.004313 9.5e-05 -0.033725" rpy="0 0 0"/>
   <parent link="J5to6_v111"/>
   <child link="hand_v111"/>
-  <axis xyz="-0.126869 -0.002806 0.991916"/>
+  <axis xyz="0.126869 0.002806 -0.991916"/>
 </joint>
 <transmission name="Revolute_1_tran">
   <type>transmission_interface/SimpleTransmission</type>
@@ -180,7 +180,7 @@
   <origin xyz="-0.001102 -2.4e-05 -0.09414" rpy="0 0 0"/>
   <parent link="J4to5_v111"/>
   <child link="J5to6_v111"/>
-  <axis xyz="-0.022114 0.999755 -0.0"/>
+  <axis xyz="0.022114 -0.999755 0.0"/>
 </joint>
 <transmission name="Revolute_2_tran">
   <type>transmission_interface/SimpleTransmission</type>
@@ -194,10 +194,10 @@
 </transmission>
 
 <joint name="Revolute_3" type="continuous">
-  <origin xyz="-0.562444 0.0 -0.0175" rpy="0 0 0"/>
+  <origin xyz="0.562444 0.0 -0.0175" rpy="0 0 0"/>
   <parent link="J3to4_v111"/>
   <child link="J4to5_v111"/>
-  <axis xyz="-0.0 -0.0 -1.0"/>
+  <axis xyz="0.0 0.0 1.0"/>
 </joint>
 <transmission name="Revolute_3_tran">
   <type>transmission_interface/SimpleTransmission</type>

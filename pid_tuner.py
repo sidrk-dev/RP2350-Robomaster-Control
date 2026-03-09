@@ -7,28 +7,84 @@ import serial.tools.list_ports
 import time
 import threading
 import re
+import math
+import queue
+from collections import deque
 from tkinter import scrolledtext
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 CONFIG_FILE = "robot_config.json"
 BAUD_RATE = 115200
 
+DARK_BG = "#0f131a"
+DARK_PANEL = "#161b22"
+DARK_ELEV = "#1b2430"
+ACCENT = "#58a6ff"
+TEXT = "#e6edf3"
+MUTED = "#9fb0c3"
+
 # Default configs
 DEFAULT_CONFIG = {
     "motors": {
-        "1": {"type": "M3508", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0},
-        "2": {"type": "M2006", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0},
-        "3": {"type": "M2006", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0},
-        "4": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0},
-        "5": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0},
-        "6": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0}
+        "1": {"type": "M3508", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False},
+        "2": {"type": "M2006", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False},
+        "3": {"type": "M2006", "gear_ratio": 94.23076923076923, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False},
+        "4": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False},
+        "5": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False},
+        "6": {"type": "M2006", "gear_ratio": 1.0, "kp": 5.0, "ki": 1.0, "kd": 0.0, "aol": 500.0, "skp": 0.3, "ski": 0.0, "skd": 0.0, "sol": 20.0, "min_angle": 0.0, "max_angle": 360.0, "zero_offset": 0.0, "abs_zero_offset": 0.0, "abs_encoder_index": None, "abs_encoder_reversed": True, "abs_pid_enabled": False}
+    },
+    "wrist_differential": {
+        "enabled": True,
+        "pitch_joint_id": 5,
+        "roll_joint_id": 6,
+        "pitch_encoder_index": None,
+        "roll_encoder_index": None,
+        "pitch_encoder_motor_id": 5,
+        "roll_encoder_motor_id": 6,
+        "motor_a_id": 5,
+        "motor_b_id": 6,
+        "mix": {
+            "motor_a_pitch_sign": 1.0,
+            "motor_a_roll_sign": 1.0,
+            "motor_b_pitch_sign": 1.0,
+            "motor_b_roll_sign": -1.0
+        },
+        "pid": {
+            "pitch_kp": 4.0,
+            "pitch_ki": 0.0,
+            "pitch_kd": 0.0,
+            "roll_kp": 4.0,
+            "roll_ki": 0.0,
+            "roll_kd": 0.0,
+            "max_axis_speed": 80.0,
+            "max_motor_speed": 120.0,
+            "deadband_deg": 0.4,
+            "integral_limit": 30.0
+        }
     }
+}
+
+SAFE_PID_PRESETS = {
+    "Conservative": {
+        "M2006": {"kp": 3.0, "ki": 0.2, "kd": 0.0, "aol": 140.0, "skp": 0.18, "ski": 0.0, "skd": 0.0, "sol": 8.0},
+        "M3508": {"kp": 4.0, "ki": 0.2, "kd": 0.0, "aol": 120.0, "skp": 0.12, "ski": 0.0, "skd": 0.0, "sol": 8.0},
+    },
+    "Balanced": {
+        "M2006": {"kp": 5.0, "ki": 0.5, "kd": 0.0, "aol": 220.0, "skp": 0.25, "ski": 0.0, "skd": 0.0, "sol": 12.0},
+        "M3508": {"kp": 8.0, "ki": 0.5, "kd": 0.0, "aol": 180.0, "skp": 0.18, "ski": 0.0, "skd": 0.0, "sol": 12.0},
+    },
+    "Aggressive": {
+        "M2006": {"kp": 8.0, "ki": 0.8, "kd": 0.0, "aol": 320.0, "skp": 0.35, "ski": 0.0, "skd": 0.0, "sol": 16.0},
+        "M3508": {"kp": 12.0, "ki": 0.8, "kd": 0.0, "aol": 260.0, "skp": 0.28, "ski": 0.0, "skd": 0.0, "sol": 16.0},
+    },
 }
 
 class MotorTab:
     def __init__(self, parent, motor_id, config_data, send_cmd_func):
         self.motor_id = motor_id
         self.config = config_data
-        
+
         # Ensure new defaults exist
         if "skp" not in self.config: self.config["skp"] = 0.3
         if "ski" not in self.config: self.config["ski"] = 0.0
@@ -38,30 +94,34 @@ class MotorTab:
         if "min_angle"   not in self.config: self.config["min_angle"]   = 0.0
         if "max_angle"   not in self.config: self.config["max_angle"]   = 360.0
         if "zero_offset" not in self.config: self.config["zero_offset"] = 0.0
-            
+        if "abs_zero_offset" not in self.config: self.config["abs_zero_offset"] = 0.0
+        if "abs_encoder_index" not in self.config: self.config["abs_encoder_index"] = None
+        if "abs_encoder_reversed" not in self.config: self.config["abs_encoder_reversed"] = True
+        if "abs_pid_enabled" not in self.config: self.config["abs_pid_enabled"] = False
+
         self.send_cmd = send_cmd_func
-        
+
         self.frame = ttk.Frame(parent, padding=10)
-        
+
         # --- Real-Time Telemetry ---
         lf_telemetry = ttk.LabelFrame(self.frame, text="Real-Time Telemetry", padding=10)
         lf_telemetry.pack(fill="x", pady=5)
-        
+
         ttk.Label(lf_telemetry, text="Current Angle:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="e", padx=5)
         self.lbl_current_angle = ttk.Label(lf_telemetry, text="---", foreground="blue", font=("Arial", 10, "bold"))
         self.lbl_current_angle.grid(row=0, column=1, sticky="w")
-        
+
         ttk.Label(lf_telemetry, text="Target Angle:", font=("Arial", 10, "bold")).grid(row=0, column=2, sticky="e", padx=(20, 5))
         self.lbl_target_angle = ttk.Label(lf_telemetry, text="---", font=("Arial", 10))
         self.lbl_target_angle.grid(row=0, column=3, sticky="w")
+        self.target_deg = None
 
         ttk.Label(lf_telemetry, text="Velocity:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="e", padx=5)
         self.lbl_current_rpm = ttk.Label(lf_telemetry, text="--- RPM", foreground="green", font=("Arial", 10, "bold"))
         self.lbl_current_rpm.grid(row=1, column=1, sticky="w")
-        
-        ttk.Label(lf_telemetry, text="Abs. Encoder:", font=("Arial", 10, "bold")).grid(row=1, column=2, sticky="e", padx=(20, 5))
-        self.lbl_abs_angle = ttk.Label(lf_telemetry, text="---", foreground="#8B4513", font=("Arial", 10, "bold"))
-        self.lbl_abs_angle.grid(row=1, column=3, sticky="w")
+        ttk.Label(lf_telemetry, text="Abs Pos (Enc):", font=("Arial", 10, "bold")).grid(row=1, column=2, sticky="e", padx=(20, 5))
+        self.lbl_abs_pos = ttk.Label(lf_telemetry, text="---", foreground="orange", font=("Arial", 10, "bold"))
+        self.lbl_abs_pos.grid(row=1, column=3, sticky="w")
 
         btn_zero = ttk.Button(lf_telemetry, text="Set Zero Position (CAL)", command=self.set_zero)
         btn_zero.grid(row=0, column=4, padx=(20, 0))
@@ -69,66 +129,112 @@ class MotorTab:
         # --- Motor Specs ---
         lf_specs = ttk.LabelFrame(self.frame, text="Motor Specifications", padding=10)
         lf_specs.pack(fill="x", pady=5)
-        
+
         ttk.Label(lf_specs, text="Motor Type:").grid(row=0, column=0, sticky="w", pady=2)
         self.var_type = tk.StringVar(value=self.config["type"])
         cb_type = ttk.Combobox(lf_specs, textvariable=self.var_type, values=["M2006", "M3508"], state="readonly", width=10)
         cb_type.grid(row=0, column=1, sticky="w", pady=2, padx=5)
         cb_type.bind("<<ComboboxSelected>>", self.on_change)
-        
+
         ttk.Label(lf_specs, text="External Gear Ratio:").grid(row=1, column=0, sticky="w", pady=2)
         self.var_gear = tk.StringVar(value=str(self.config["gear_ratio"]))
         en_gear = ttk.Entry(lf_specs, textvariable=self.var_gear, width=20)
         en_gear.grid(row=1, column=1, sticky="w", pady=2, padx=5)
         en_gear.bind("<KeyRelease>", self.on_change)
-        
+
         btn_apply_gear = ttk.Button(lf_specs, text="Apply Gear to Arm", command=self.apply_gear)
         btn_apply_gear.grid(row=1, column=2, padx=10)
-        
+
+        # --- Absolute Encoder Mapping ---
+        lf_encoder = ttk.LabelFrame(self.frame, text="Absolute Encoder Mapping", padding=10)
+        lf_encoder.pack(fill="x", pady=5)
+
+        ttk.Label(lf_encoder, text="Encoder Index").grid(row=0, column=0, sticky="w")
+        self.var_abs_enc = tk.StringVar(value=("None" if self.config.get("abs_encoder_index") is None else str(int(self.config.get("abs_encoder_index")))))
+        cb_abs = ttk.Combobox(lf_encoder, textvariable=self.var_abs_enc, values=["None"] + [str(i) for i in range(8)], state="readonly", width=8)
+        cb_abs.grid(row=0, column=1, sticky="w", padx=6)
+        cb_abs.bind("<<ComboboxSelected>>", self.on_change)
+
+        self.var_abs_rev = tk.BooleanVar(value=bool(self.config.get("abs_encoder_reversed", True)))
+        ttk.Checkbutton(lf_encoder, text="Reversed", variable=self.var_abs_rev, command=self.on_change).grid(row=0, column=2, sticky="w", padx=(12, 6))
+
+        self.var_abs_pid = tk.BooleanVar(value=bool(self.config.get("abs_pid_enabled", False)))
+        ttk.Checkbutton(lf_encoder, text="Use ABS for PID", variable=self.var_abs_pid, command=self.on_change).grid(row=0, column=3, sticky="w", padx=(12, 6))
+
+        ttk.Button(lf_encoder, text="Apply Encoder Mapping", command=self.apply_encoder_mapping).grid(row=0, column=4, sticky="e", padx=6)
+        ttk.Button(lf_encoder, text="Apply ABS PID", command=self.apply_abs_pid).grid(row=0, column=5, sticky="e", padx=6)
+        lf_encoder.columnconfigure(6, weight=1)
+
         # --- PID Frames Container ---
         pid_container = ttk.Frame(self.frame)
         pid_container.pack(fill="x", pady=5)
-        
+
         # --- Angle PID ---
         lf_pid = ttk.LabelFrame(pid_container, text="Angle PID Tuning", padding=10)
         lf_pid.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        
+
         self.var_kp = tk.DoubleVar(value=self.config["kp"])
         self.var_ki = tk.DoubleVar(value=self.config["ki"])
         self.var_kd = tk.DoubleVar(value=self.config["kd"])
         self.var_aol = tk.DoubleVar(value=self.config["aol"])
-        
+
         self.create_entry(lf_pid, "Kp:", self.var_kp, row=0)
         self.create_entry(lf_pid, "Ki:", self.var_ki, row=1)
         self.create_entry(lf_pid, "Kd:", self.var_kd, row=2)
         self.create_entry(lf_pid, "Max Speed (RPM):", self.var_aol, row=3)
-        
+
         ttk.Button(lf_pid, text="Apply Angle PID", command=self.apply_angle_pid).grid(row=4, column=0, columnspan=2, pady=10)
-        
+
         # --- Speed PID ---
         lf_spid = ttk.LabelFrame(pid_container, text="Speed PID Tuning", padding=10)
         lf_spid.pack(side="right", fill="x", expand=True, padx=(5, 0))
-        
+
         self.var_skp = tk.DoubleVar(value=self.config["skp"])
         self.var_ski = tk.DoubleVar(value=self.config["ski"])
         self.var_skd = tk.DoubleVar(value=self.config["skd"])
         self.var_sol = tk.DoubleVar(value=self.config["sol"])
-        
+
         self.create_entry(lf_spid, "Kp:", self.var_skp, row=0)
         self.create_entry(lf_spid, "Ki:", self.var_ski, row=1)
         self.create_entry(lf_spid, "Kd:", self.var_skd, row=2)
         self.create_entry(lf_spid, "Max Current (A):", self.var_sol, row=3)
-        
+
         ttk.Button(lf_spid, text="Apply Speed PID", command=self.apply_speed_pid).grid(row=4, column=0, columnspan=2, pady=10)
-        
+
+        # --- Quick Presets ---
+        lf_presets = ttk.LabelFrame(self.frame, text="Quick Presets", padding=10)
+        lf_presets.pack(fill="x", pady=5)
+        self.var_preset = tk.StringVar(value="Conservative")
+        ttk.Label(lf_presets, text="Preset:").pack(side="left")
+        ttk.Combobox(
+            lf_presets,
+            textvariable=self.var_preset,
+            values=list(SAFE_PID_PRESETS.keys()),
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=6)
+        ttk.Button(lf_presets, text="Load Preset", command=self.load_selected_preset).pack(side="left", padx=4)
+        ttk.Button(lf_presets, text="Apply Motor All", command=self.apply_motor_all).pack(side="left", padx=8)
+
         # --- Test Controls ---
         lf_test = ttk.LabelFrame(self.frame, text="Testing Controls", padding=10)
         lf_test.pack(fill="x", pady=5)
-        
-        ttk.Button(lf_test, text="Move to 0°",   command=lambda: self.test_move(0)).pack(side="left", padx=5)
-        ttk.Button(lf_test, text="Move to 90°",  command=lambda: self.test_move(90)).pack(side="left", padx=5)
-        ttk.Button(lf_test, text="Move to 180°", command=lambda: self.test_move(180)).pack(side="left", padx=5)
-        ttk.Button(lf_test, text="Move to 270°", command=lambda: self.test_move(270)).pack(side="left", padx=5)
+
+        ttk.Button(lf_test, text="Go 0 (ABS)",   command=lambda: self.test_move(0)).pack(side="left", padx=5)
+        ttk.Button(lf_test, text="Go 90 (ABS)",  command=lambda: self.test_move(90)).pack(side="left", padx=5)
+        ttk.Button(lf_test, text="Go 180 (ABS)", command=lambda: self.test_move(180)).pack(side="left", padx=5)
+        ttk.Button(lf_test, text="Go 270 (ABS)", command=lambda: self.test_move(270)).pack(side="left", padx=5)
+
+        self.var_custom_abs = tk.StringVar(value="0")
+        self.var_custom_delta = tk.StringVar(value="5")
+        ttk.Separator(lf_test, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(lf_test, text="Abs:").pack(side="left", padx=(2, 2))
+        ttk.Entry(lf_test, textvariable=self.var_custom_abs, width=7).pack(side="left", padx=(0, 4))
+        ttk.Button(lf_test, text="Go", command=self.test_move_custom).pack(side="left", padx=(0, 6))
+        ttk.Label(lf_test, text="Rel:").pack(side="left", padx=(2, 2))
+        ttk.Entry(lf_test, textvariable=self.var_custom_delta, width=7).pack(side="left", padx=(0, 4))
+        ttk.Button(lf_test, text="Jog", command=self.jog_custom).pack(side="left", padx=(0, 6))
+
         ttk.Button(lf_test, text="STOP", command=lambda: self.send_cmd("S")).pack(side="right", padx=5)
 
         # --- Jog Controls ---
@@ -167,15 +273,20 @@ class MotorTab:
         self._gauge_canvas = tk.Canvas(lf_vis, width=self._gauge_size, height=self._gauge_size,
                                         bg="white", highlightthickness=0)
         self._gauge_canvas.pack(side="left", padx=10)
-        self._gauge_current_deg = 0.0  # updated by telemetry
+        self._gauge_current_deg = None  # updated by telemetry
 
         # Legend next to gauge
         legend = ttk.Frame(lf_vis)
         legend.pack(side="left", padx=10, anchor="n")
         ttk.Label(legend, text="● Gray = full 360°",   foreground="gray",   font=("Arial", 8)).pack(anchor="w")
         ttk.Label(legend, text="● Green = allowed",     foreground="#2d8a2d", font=("Arial", 8)).pack(anchor="w")
-        ttk.Label(legend, text="● Blue = current pos",  foreground="blue",   font=("Arial", 8)).pack(anchor="w")
+        ttk.Label(legend, text="● Blue = logic pos",  foreground="blue",   font=("Arial", 8)).pack(anchor="w")
         ttk.Label(legend, text="● Red = zero (CAL 0°)", foreground="red",    font=("Arial", 8)).pack(anchor="w")
+        ttk.Label(legend, text="● Orange = abs enc pos", foreground="orange",   font=("Arial", 8)).pack(anchor="w")
+
+        self._gauge_abs_deg = None  # updated by telemetry (if APOS exists)
+
+        self._last_telemetry_time = 0.0
 
         self._draw_gauge()  # initial draw
         # Redraw periodically
@@ -184,14 +295,14 @@ class MotorTab:
 
     def create_entry(self, parent, label, variable, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=5)
-        
+
         def entry_changed(*args):
             try:
                 variable.get()  # will throw TclError if empty
                 self.on_change()
             except Exception:
                 pass  # ignore empty field / invalid input during typing
-                
+
         # To avoid infinite loop, use trace sparingly or bind
         entry = ttk.Entry(parent, textvariable=variable, width=15)
         entry.grid(row=row, column=1, padx=5, pady=5, sticky="w")
@@ -215,12 +326,58 @@ class MotorTab:
         except ValueError:
             pass
 
+        try:
+            v = self.var_abs_enc.get().strip()
+            if v.lower() == "none" or v == "":
+                self.config["abs_encoder_index"] = None
+            else:
+                self.config["abs_encoder_index"] = int(v)
+        except Exception:
+            self.config["abs_encoder_index"] = None
+
+        try:
+            self.config["abs_encoder_reversed"] = bool(self.var_abs_rev.get())
+        except Exception:
+            self.config["abs_encoder_reversed"] = True
+
+        try:
+            self.config["abs_pid_enabled"] = bool(self.var_abs_pid.get())
+        except Exception:
+            self.config["abs_pid_enabled"] = False
+
     def apply_gear(self):
         try:
             gr = float(self.var_gear.get())
             self.send_cmd(f"GEAR {self.motor_id} {gr}")
         except ValueError:
             messagebox.showerror("Error", "Invalid Gear Ratio")
+
+    def apply_encoder_mapping(self):
+        self.on_change()
+        enc_idx = self.config.get("abs_encoder_index")
+        mid = int(self.motor_id)
+
+        if enc_idx is None:
+            self.send_cmd(f"ENCMAP 0 0")
+            return
+
+        try:
+            enc_i = int(enc_idx)
+        except Exception:
+            messagebox.showerror("Error", "Invalid encoder index")
+            return
+
+        if enc_i < 0 or enc_i > 7:
+            messagebox.showerror("Error", "Encoder index must be 0-7")
+            return
+
+        self.send_cmd(f"ENCMAP {enc_i} {mid}")
+
+    def apply_abs_pid(self):
+        self.on_change()
+        mid = int(self.motor_id)
+        enable = 1 if bool(self.config.get("abs_pid_enabled", False)) else 0
+        self.send_cmd(f"ABSPID {mid} {enable}")
 
     def apply_angle_pid(self):
         kp = self.var_kp.get()
@@ -240,24 +397,137 @@ class MotorTab:
         batch = f"SKP {mid} {skp:.4f}; SKI {mid} {ski:.4f}; SKD {mid} {skd:.4f}; SOL {mid} {sol:.2f}"
         self.send_cmd(batch)
 
+    def load_selected_preset(self):
+        preset_name = self.var_preset.get()
+        motor_type = self.var_type.get()
+        preset = SAFE_PID_PRESETS.get(preset_name, {}).get(motor_type)
+        if not preset:
+            messagebox.showerror("Preset Error", f"No preset found for {preset_name}/{motor_type}")
+            return
+
+        self.var_kp.set(preset["kp"])
+        self.var_ki.set(preset["ki"])
+        self.var_kd.set(preset["kd"])
+        self.var_aol.set(preset["aol"])
+        self.var_skp.set(preset["skp"])
+        self.var_ski.set(preset["ski"])
+        self.var_skd.set(preset["skd"])
+        self.var_sol.set(preset["sol"])
+        self.on_change()
+
+    def apply_motor_all(self):
+        self.on_change()
+        mid = self.motor_id
+        gr = self.var_gear.get()
+        mn = self.var_min.get()
+        mx = self.var_max.get()
+        if mx <= mn:
+            messagebox.showerror("Error", "Max angle must be greater than Min angle")
+            return
+        kp = self.var_kp.get()
+        ki = self.var_ki.get()
+        kd = self.var_kd.get()
+        aol = self.var_aol.get()
+        skp = self.var_skp.get()
+        ski = self.var_ski.get()
+        skd = self.var_skd.get()
+        sol = self.var_sol.get()
+        batch = (
+            f"GEAR {mid} {float(gr):.6f}"
+            f"; JLIM {mid} {mn:.1f} {mx:.1f}"
+            f"; KP {mid} {kp:.4f}; KI {mid} {ki:.4f}; KD {mid} {kd:.4f}; AOL {mid} {aol:.2f}"
+            f"; SKP {mid} {skp:.4f}; SKI {mid} {ski:.4f}; SKD {mid} {skd:.4f}; SOL {mid} {sol:.2f}"
+        )
+        self.send_cmd(batch)
+
     def test_move(self, angle):
+        angle = float(angle)
         self.send_cmd(f"P {self.motor_id} {angle}")
-        self.lbl_target_angle.config(text=f"{angle}°")
-        
+        self._set_target_display(angle)
+
+    def test_move_custom(self):
+        try:
+            angle = float(self.var_custom_abs.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid absolute angle value")
+            return
+        self.send_cmd(f"P {self.motor_id} {angle}")
+        self._set_target_display(angle)
+
     def jog(self, delta):
         """Jog motor by delta degrees using relative PR command."""
         self.send_cmd(f"PR {self.motor_id} {delta}")
 
+    def jog_custom(self):
+        try:
+            delta = float(self.var_custom_delta.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid relative delta value")
+            return
+        self.send_cmd(f"PR {self.motor_id} {delta}")
+
     def set_zero(self):
         self.send_cmd(f"CAL {self.motor_id} 0")
-        self.lbl_target_angle.config(text="0°")
+        self._set_target_display(0.0)
 
     def apply_limits(self):
         mid = self.motor_id
         mn  = self.var_min.get()
         mx  = self.var_max.get()
+        if mx <= mn:
+            messagebox.showerror("Error", "Max angle must be greater than Min angle")
+            return
         self.on_change()  # persist to config
         self.send_cmd(f"JLIM {mid} {mn:.1f} {mx:.1f}")
+        if self.target_deg is not None:
+            self._set_target_display(self.target_deg, reference=self._gauge_current_deg)
+
+    def _clamp_target_to_limits(self, angle):
+        mn = self.var_min.get()
+        mx = self.var_max.get()
+        if mx <= mn:
+            mn, mx = 0.0, 360.0
+        width = mx - mn
+        a = float(angle)
+        if width >= 359.5:
+            while a >= 360.0:
+                a -= 360.0
+            while a < 0.0:
+                a += 360.0
+            return a
+        return max(mn, min(mx, a))
+
+    def _project_target_to_limits(self, angle, reference=None):
+        """Project a logical angle into the same frame used by firmware limits."""
+        mn = self.var_min.get()
+        mx = self.var_max.get()
+        if mx <= mn:
+            mn, mx = 0.0, 360.0
+        width = mx - mn
+        a = float(angle)
+        if width >= 359.5:
+            while a >= 360.0:
+                a -= 360.0
+            while a < 0.0:
+                a += 360.0
+            return a
+
+        if mn <= a <= mx:
+            return a
+
+        if reference is None:
+            if self._gauge_current_deg is not None:
+                reference = self._gauge_current_deg
+            else:
+                reference = (mn + mx) * 0.5
+        turns = round((float(reference) - a) / 360.0)
+        a = a + (turns * 360.0)
+        return max(mn, min(mx, a))
+
+    def _set_target_display(self, angle, reference=None):
+        projected = self._project_target_to_limits(angle, reference=reference)
+        self.target_deg = projected
+        self.lbl_target_angle.config(text=f"{projected:.1f}°")
 
     def _draw_gauge(self):
         import math
@@ -306,46 +576,545 @@ class MotorTab:
         zy2 = cy + (r + 2) * math.sin(rad_z)
         c.create_line(zx1, zy1, zx2, zy2, fill="red", width=2)
 
-        # Blue needle for current position
+        # Blue needle for logical position
         cur = self._gauge_current_deg
-        rad_c = math.radians(cur - 90)  # -90 so 0=top
-        nx = cx + (r - 14) * math.cos(rad_c)
-        ny = cy + (r - 14) * math.sin(rad_c)
-        c.create_line(cx, cy, nx, ny, fill="blue", width=2, arrow="last")
+        if cur is not None:
+            rad_c = math.radians(cur - 90)  # -90 so 0=top
+            nx = cx + (r - 14) * math.cos(rad_c)
+            ny = cy + (r - 14) * math.sin(rad_c)
+            c.create_line(cx, cy, nx, ny, fill="blue", width=2, arrow="last")
+
+        # Orange needle for Absolute Encoder Position (if available)
+        if self._gauge_abs_deg is not None:
+            rad_a = math.radians(self._gauge_abs_deg - 90)
+            ax = cx + (r - 20) * math.cos(rad_a)
+            ay = cy + (r - 20) * math.sin(rad_a)
+            c.create_line(cx, cy, ax, ay, fill="orange", width=2, dash=(4,2), arrow="last")
 
         # Center dot
         c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="blue")
 
     def _gauge_tick(self):
         try:
+            now = time.time()
+            if getattr(self, "_last_telemetry_time", 0.0) > 0 and (now - self._last_telemetry_time > 2.0):
+                self.lbl_current_angle.config(text="Disconnected", foreground="red")
+                self.lbl_current_rpm.config(text="Disconnected", foreground="red")
+                self.lbl_abs_pos.config(text="Disconnected", foreground="red")
+                self._gauge_current_deg = None
+                self._gauge_abs_deg = None
             self._draw_gauge()
         except Exception:
             pass
         self._gauge_canvas.after(250, self._gauge_tick)
 
+class WristDiagnosticsTab:
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent, padding=10)
 
+        lf = ttk.LabelFrame(self.frame, text="Differential Wrist Output Kinematics", padding=15)
+        lf.pack(fill="x", pady=5)
+
+        ttk.Label(lf, text="True Pitch (M5 + M6)/2 :").grid(row=0, column=0, sticky="e", padx=5, pady=5)
+        self.lbl_pitch = ttk.Label(lf, text="---", foreground="purple", font=("Arial", 14, "bold"))
+        self.lbl_pitch.grid(row=0, column=1, sticky="w", pady=5)
+
+        ttk.Label(lf, text="True Roll (M5 - M6)/2 :").grid(row=1, column=0, sticky="e", padx=5, pady=5)
+        self.lbl_roll = ttk.Label(lf, text="---", foreground="teal", font=("Arial", 14, "bold"))
+        self.lbl_roll.grid(row=1, column=1, sticky="w", pady=5)
+
+        ttk.Label(lf, text="* Calculated automatically from Absolute Encoders mounted to Motor 5 and Motor 6.\n* If Pitch and Roll behave inverted, swap the + and - in ik_arm_control.py", font=("Arial", 9, "italic")).grid(row=2, column=0, columnspan=2, sticky="w", pady=10)
+
+        self.m5_apos = None
+        self.m6_apos = None
+
+    def update_values(self):
+        if self.m5_apos is not None and self.m6_apos is not None:
+            pitch = (self.m5_apos + self.m6_apos) / 2.0
+            roll = (self.m5_apos - self.m6_apos) / 2.0
+            self.lbl_pitch.config(text=f"{pitch:.1f}°")
+            self.lbl_roll.config(text=f"{roll:.1f}°")
+        else:
+            self.lbl_pitch.config(text="N/A")
+            self.lbl_roll.config(text="N/A")
+
+class WristTuningTab:
+    def __init__(self, parent, app, config_data, send_cmd_func):
+        self.app = app
+        self.config = config_data
+        self.send_cmd = send_cmd_func
+        self.frame = ttk.Frame(parent, padding=10)
+        self._ensure_defaults()
+
+        tele = ttk.LabelFrame(self.frame, text="Wrist Differential Telemetry", padding=10)
+        tele.pack(fill="x", pady=5)
+
+        ttk.Label(tele, text="Pitch:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_pitch = ttk.Label(tele, text="---", foreground="purple", font=("Arial", 10, "bold"))
+        self.lbl_pitch.grid(row=0, column=1, sticky="w")
+        ttk.Label(tele, text="Target:").grid(row=0, column=2, sticky="e", padx=(18, 5))
+        self.lbl_pitch_target = ttk.Label(tele, text="---")
+        self.lbl_pitch_target.grid(row=0, column=3, sticky="w")
+        ttk.Label(tele, text="Error:").grid(row=0, column=4, sticky="e", padx=(18, 5))
+        self.lbl_pitch_error = ttk.Label(tele, text="---")
+        self.lbl_pitch_error.grid(row=0, column=5, sticky="w")
+
+        ttk.Label(tele, text="Roll:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_roll = ttk.Label(tele, text="---", foreground="teal", font=("Arial", 10, "bold"))
+        self.lbl_roll.grid(row=1, column=1, sticky="w")
+        ttk.Label(tele, text="Target:").grid(row=1, column=2, sticky="e", padx=(18, 5))
+        self.lbl_roll_target = ttk.Label(tele, text="---")
+        self.lbl_roll_target.grid(row=1, column=3, sticky="w")
+        ttk.Label(tele, text="Error:").grid(row=1, column=4, sticky="e", padx=(18, 5))
+        self.lbl_roll_error = ttk.Label(tele, text="---")
+        self.lbl_roll_error.grid(row=1, column=5, sticky="w")
+
+        ttk.Label(tele, text="Motor A cmd:").grid(row=2, column=0, sticky="e", padx=5, pady=(8, 2))
+        self.lbl_motor_a = ttk.Label(tele, text="---")
+        self.lbl_motor_a.grid(row=2, column=1, sticky="w")
+        ttk.Label(tele, text="Motor B cmd:").grid(row=2, column=2, sticky="e", padx=(18, 5), pady=(8, 2))
+        self.lbl_motor_b = ttk.Label(tele, text="---")
+        self.lbl_motor_b.grid(row=2, column=3, sticky="w")
+
+        cfg = ttk.LabelFrame(self.frame, text="Wrist Differential Tuning", padding=10)
+        cfg.pack(fill="x", pady=5)
+
+        self.var_enabled = tk.BooleanVar(value=bool(self.config.get("enabled", True)))
+        self.var_pitch_enc = tk.StringVar(value=("None" if self.config.get("pitch_encoder_index") is None else str(int(self.config.get("pitch_encoder_index")))))
+        self.var_roll_enc = tk.StringVar(value=("None" if self.config.get("roll_encoder_index") is None else str(int(self.config.get("roll_encoder_index")))))
+        self.var_pitch_kp = tk.DoubleVar(value=float(self.config["pid"].get("pitch_kp", 4.0)))
+        self.var_pitch_ki = tk.DoubleVar(value=float(self.config["pid"].get("pitch_ki", 0.0)))
+        self.var_pitch_kd = tk.DoubleVar(value=float(self.config["pid"].get("pitch_kd", 0.0)))
+        self.var_roll_kp = tk.DoubleVar(value=float(self.config["pid"].get("roll_kp", 4.0)))
+        self.var_roll_ki = tk.DoubleVar(value=float(self.config["pid"].get("roll_ki", 0.0)))
+        self.var_roll_kd = tk.DoubleVar(value=float(self.config["pid"].get("roll_kd", 0.0)))
+        self.var_max_axis_speed = tk.DoubleVar(value=float(self.config["pid"].get("max_axis_speed", 80.0)))
+        self.var_max_motor_speed = tk.DoubleVar(value=float(self.config["pid"].get("max_motor_speed", 120.0)))
+        self.var_deadband = tk.DoubleVar(value=float(self.config["pid"].get("deadband_deg", 0.4)))
+        self.var_int_limit = tk.DoubleVar(value=float(self.config["pid"].get("integral_limit", 30.0)))
+
+        ttk.Checkbutton(cfg, text="Enable wrist differential", variable=self.var_enabled, command=self.on_change).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(cfg, text="Pitch Encoder Slot").grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        cb_pitch = ttk.Combobox(cfg, textvariable=self.var_pitch_enc, values=["None"] + [str(i) for i in range(8)], state="readonly", width=8)
+        cb_pitch.grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        cb_pitch.bind("<<ComboboxSelected>>", self.on_change)
+        ttk.Label(cfg, text="Roll Encoder Slot").grid(row=1, column=2, sticky="e", padx=5, pady=3)
+        cb_roll = ttk.Combobox(cfg, textvariable=self.var_roll_enc, values=["None"] + [str(i) for i in range(8)], state="readonly", width=8)
+        cb_roll.grid(row=1, column=3, sticky="w", padx=5, pady=3)
+        cb_roll.bind("<<ComboboxSelected>>", self.on_change)
+
+        self._entry(cfg, "Pitch Kp", self.var_pitch_kp, 2, 0)
+        self._entry(cfg, "Pitch Ki", self.var_pitch_ki, 2, 2)
+        self._entry(cfg, "Pitch Kd", self.var_pitch_kd, 3, 0)
+        self._entry(cfg, "Roll Kp", self.var_roll_kp, 3, 2)
+        self._entry(cfg, "Roll Ki", self.var_roll_ki, 4, 0)
+        self._entry(cfg, "Roll Kd", self.var_roll_kd, 4, 2)
+        self._entry(cfg, "Max Axis Speed", self.var_max_axis_speed, 5, 0)
+        self._entry(cfg, "Max Motor Speed", self.var_max_motor_speed, 5, 2)
+        self._entry(cfg, "Deadband (deg)", self.var_deadband, 6, 0)
+        self._entry(cfg, "Integral Limit", self.var_int_limit, 6, 2)
+
+        btns = ttk.Frame(cfg)
+        btns.grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(btns, text="Apply Wrist Config", command=self.apply_config).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Stop Wrist", command=self.stop_wrist).pack(side="left", padx=6)
+
+    def _ensure_defaults(self):
+        default = DEFAULT_CONFIG["wrist_differential"]
+        for key, value in default.items():
+            if key not in self.config:
+                self.config[key] = json.loads(json.dumps(value)) if isinstance(value, dict) else value
+        if not isinstance(self.config.get("mix"), dict):
+            self.config["mix"] = dict(default["mix"])
+        else:
+            merged_mix = dict(default["mix"])
+            merged_mix.update(self.config["mix"])
+            self.config["mix"] = merged_mix
+        if not isinstance(self.config.get("pid"), dict):
+            self.config["pid"] = dict(default["pid"])
+        else:
+            merged_pid = dict(default["pid"])
+            merged_pid.update(self.config["pid"])
+            self.config["pid"] = merged_pid
+
+    def _entry(self, parent, label, variable, row, col):
+        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="e", padx=5, pady=3)
+        entry = ttk.Entry(parent, textvariable=variable, width=10)
+        entry.grid(row=row, column=col + 1, sticky="w", padx=5, pady=3)
+        entry.bind("<KeyRelease>", self.on_change)
+
+    def on_change(self, *args):
+        self.config["enabled"] = bool(self.var_enabled.get())
+        for cfg_key, widget_val in (("pitch_encoder_index", self.var_pitch_enc.get()), ("roll_encoder_index", self.var_roll_enc.get())):
+            try:
+                token = str(widget_val).strip()
+                self.config[cfg_key] = None if token.lower() == "none" or token == "" else int(token)
+            except Exception:
+                self.config[cfg_key] = None
+        try:
+            self.config["pid"]["pitch_kp"] = float(self.var_pitch_kp.get())
+            self.config["pid"]["pitch_ki"] = float(self.var_pitch_ki.get())
+            self.config["pid"]["pitch_kd"] = float(self.var_pitch_kd.get())
+            self.config["pid"]["roll_kp"] = float(self.var_roll_kp.get())
+            self.config["pid"]["roll_ki"] = float(self.var_roll_ki.get())
+            self.config["pid"]["roll_kd"] = float(self.var_roll_kd.get())
+            self.config["pid"]["max_axis_speed"] = float(self.var_max_axis_speed.get())
+            self.config["pid"]["max_motor_speed"] = float(self.var_max_motor_speed.get())
+            self.config["pid"]["deadband_deg"] = float(self.var_deadband.get())
+            self.config["pid"]["integral_limit"] = float(self.var_int_limit.get())
+        except Exception:
+            pass
+
+    def apply_config(self):
+        self.on_change()
+        self.app.apply_wrist_settings()
+
+    def stop_wrist(self):
+        self.send_cmd("M 5 0; M 6 0")
+
+    def update_values(self, telemetry):
+        pitch = telemetry.get("pitch")
+        roll = telemetry.get("roll")
+        pitch_target = telemetry.get("pitch_target")
+        roll_target = telemetry.get("roll_target")
+        motor_a = telemetry.get("motor_a_cmd")
+        motor_b = telemetry.get("motor_b_cmd")
+        self.lbl_pitch.config(text=(f"{pitch:.1f}°" if pitch is not None else "N/A"))
+        self.lbl_roll.config(text=(f"{roll:.1f}°" if roll is not None else "N/A"))
+        self.lbl_pitch_target.config(text=(f"{pitch_target:.1f}°" if pitch_target is not None else "---"))
+        self.lbl_roll_target.config(text=(f"{roll_target:.1f}°" if roll_target is not None else "---"))
+        self.lbl_pitch_error.config(text=(f"{(pitch_target - pitch):.1f}°" if pitch is not None and pitch_target is not None else "---"))
+        self.lbl_roll_error.config(text=(f"{(roll_target - roll):.1f}°" if roll is not None and roll_target is not None else "---"))
+        self.lbl_motor_a.config(text=(f"{motor_a:.1f} RPM" if motor_a is not None else "---"))
+        self.lbl_motor_b.config(text=(f"{motor_b:.1f} RPM" if motor_b is not None else "---"))
+
+class SpeedTunerTab:
+    def __init__(self, parent, send_cmd):
+        self.frame = ttk.Frame(parent, padding=10)
+        self.send_cmd = send_cmd
+
+        self.var_motor = tk.IntVar(value=1)
+        self.var_skp = tk.DoubleVar(value=0.30)
+        self.var_ski = tk.DoubleVar(value=0.00)
+        self.var_skd = tk.DoubleVar(value=0.00)
+        self.var_sol = tk.DoubleVar(value=12.0)
+        self.var_target = tk.DoubleVar(value=120.0)
+        self.var_hold = tk.DoubleVar(value=1.5)
+        self.var_sweep_start = tk.DoubleVar(value=0.0)
+        self.var_sweep_end = tk.DoubleVar(value=240.0)
+        self.var_sweep_step = tk.DoubleVar(value=40.0)
+        self.var_sweep_dwell = tk.DoubleVar(value=0.8)
+        self.var_open_loop = tk.BooleanVar(value=False)
+
+        self.telemetry = {i: deque(maxlen=1800) for i in range(1, 9)}
+        self.step_active = False
+        self.step_motor = 1
+        self.step_target = 0.0
+        self.step_t0 = 0.0
+        self.stop_sweep = False
+        self.sweep_thread = None
+
+        self._build_ui()
+        self.frame.after(120, self._update_plot)
+
+    def _build_ui(self):
+        gains = ttk.LabelFrame(self.frame, text="Speed PID", padding=10)
+        gains.pack(fill="x", pady=(0, 8))
+        ttk.Label(gains, text="Motor").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(gains, from_=1, to=8, textvariable=self.var_motor, width=6).grid(row=0, column=1, padx=4, sticky="w")
+        ttk.Label(gains, text="SKP").grid(row=0, column=2, padx=(10, 2), sticky="w")
+        ttk.Entry(gains, textvariable=self.var_skp, width=10).grid(row=0, column=3, sticky="w")
+        ttk.Label(gains, text="SKI").grid(row=0, column=4, padx=(10, 2), sticky="w")
+        ttk.Entry(gains, textvariable=self.var_ski, width=10).grid(row=0, column=5, sticky="w")
+        ttk.Label(gains, text="SKD").grid(row=0, column=6, padx=(10, 2), sticky="w")
+        ttk.Entry(gains, textvariable=self.var_skd, width=10).grid(row=0, column=7, sticky="w")
+        ttk.Label(gains, text="SOL (A)").grid(row=0, column=8, padx=(10, 2), sticky="w")
+        ttk.Entry(gains, textvariable=self.var_sol, width=10).grid(row=0, column=9, sticky="w")
+        ttk.Button(gains, text="Apply Speed Gains", command=self.apply_gains).grid(row=0, column=10, padx=8)
+        ttk.Checkbutton(gains, text="Bypass Speed PID (MV open-loop)", variable=self.var_open_loop).grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+
+        tests = ttk.LabelFrame(self.frame, text="Step/Sweep Tests", padding=10)
+        tests.pack(fill="x", pady=(0, 8))
+        ttk.Label(tests, text="Target RPM").grid(row=0, column=0, sticky="w")
+        ttk.Entry(tests, textvariable=self.var_target, width=10).grid(row=0, column=1, padx=4, sticky="w")
+        ttk.Button(tests, text="Step +", command=lambda: self.start_step(abs(self.var_target.get()))).grid(row=0, column=2, padx=4)
+        ttk.Button(tests, text="Step -", command=lambda: self.start_step(-abs(self.var_target.get()))).grid(row=0, column=3, padx=4)
+        ttk.Button(tests, text="Stop Motor", command=self.stop_motor).grid(row=0, column=4, padx=4)
+
+        ttk.Label(tests, text="Hold (s)").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tests, textvariable=self.var_hold, width=10).grid(row=1, column=1, padx=4, sticky="w", pady=(8, 0))
+        ttk.Button(tests, text="Run Timed Step", command=self.run_timed_step).grid(row=1, column=2, padx=4, pady=(8, 0))
+
+        ttk.Label(tests, text="Sweep Start").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tests, textvariable=self.var_sweep_start, width=10).grid(row=2, column=1, padx=4, sticky="w", pady=(8, 0))
+        ttk.Label(tests, text="Sweep End").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(tests, textvariable=self.var_sweep_end, width=10).grid(row=2, column=3, padx=4, sticky="w", pady=(8, 0))
+        ttk.Label(tests, text="Step").grid(row=2, column=4, sticky="w", pady=(8, 0))
+        ttk.Entry(tests, textvariable=self.var_sweep_step, width=10).grid(row=2, column=5, padx=4, sticky="w", pady=(8, 0))
+        ttk.Label(tests, text="Dwell (s)").grid(row=2, column=6, sticky="w", pady=(8, 0))
+        ttk.Entry(tests, textvariable=self.var_sweep_dwell, width=10).grid(row=2, column=7, padx=4, sticky="w", pady=(8, 0))
+        ttk.Button(tests, text="Run Sweep", command=self.start_sweep).grid(row=2, column=8, padx=6, pady=(8, 0))
+        ttk.Button(tests, text="Stop Sweep", command=self.stop_sweep_test).grid(row=2, column=9, padx=6, pady=(8, 0))
+
+        self.lbl_metrics = ttk.Label(self.frame, text="Rise: --  Overshoot: --  Settling: --  SSE: --", font=("Consolas", 10))
+        self.lbl_metrics.pack(anchor="w", pady=(2, 6))
+
+        fig = Figure(figsize=(8.2, 3.6), dpi=100)
+        self.ax_rpm = fig.add_subplot(211)
+        self.ax_cur = fig.add_subplot(212, sharex=self.ax_rpm)
+        self.ax_rpm.set_ylabel("RPM")
+        self.ax_cur.set_ylabel("A")
+        self.ax_cur.set_xlabel("Time (s)")
+        self.ax_rpm.grid(True, alpha=0.25)
+        self.ax_cur.grid(True, alpha=0.25)
+        self.line_rpm, = self.ax_rpm.plot([], [], color="tab:blue", linewidth=1.7, label="Actual RPM")
+        self.line_target, = self.ax_rpm.plot([], [], color="tab:orange", linewidth=1.2, linestyle="--", label="Target")
+        self.line_cur, = self.ax_cur.plot([], [], color="tab:green", linewidth=1.4, label="Current")
+        self.ax_rpm.legend(loc="upper left")
+        self.ax_cur.legend(loc="upper left")
+        self.canvas = FigureCanvasTkAgg(fig, master=self.frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def apply_gains(self):
+        mid = int(self.var_motor.get())
+        cmd = (
+            f"SKP {mid} {self.var_skp.get():.4f}; SKI {mid} {self.var_ski.get():.4f}; "
+            f"SKD {mid} {self.var_skd.get():.4f}; SOL {mid} {self.var_sol.get():.2f}"
+        )
+        self.send_cmd(cmd)
+
+    def start_step(self, target_rpm):
+        mid = int(self.var_motor.get())
+        cmd = "MV" if self.var_open_loop.get() else "M"
+        self.send_cmd(f"{cmd} {mid} {target_rpm:.2f}")
+        self.step_active = True
+        self.step_motor = mid
+        self.step_target = float(target_rpm)
+        self.step_t0 = time.time()
+
+    def stop_motor(self):
+        mid = int(self.var_motor.get())
+        cmd = "MV" if self.var_open_loop.get() else "M"
+        self.send_cmd(f"{cmd} {mid} 0")
+        self.step_active = False
+
+    def run_timed_step(self):
+        hold = max(0.1, float(self.var_hold.get()))
+        self.start_step(self.var_target.get())
+
+        def _worker():
+            time.sleep(hold)
+            self.frame.after(0, self.stop_motor)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_sweep(self):
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            return
+        self.stop_sweep = False
+        self.sweep_thread = threading.Thread(target=self._sweep_worker, daemon=True)
+        self.sweep_thread.start()
+
+    def stop_sweep_test(self):
+        self.stop_sweep = True
+
+    def _sweep_worker(self):
+        start = float(self.var_sweep_start.get())
+        end = float(self.var_sweep_end.get())
+        step = abs(float(self.var_sweep_step.get()))
+        dwell = max(0.1, float(self.var_sweep_dwell.get()))
+        if step <= 0.0:
+            return
+        direction = 1.0 if end >= start else -1.0
+        val = start
+        while not self.stop_sweep:
+            self.frame.after(0, lambda rpm=val: self.start_step(rpm))
+            t0 = time.time()
+            while time.time() - t0 < dwell:
+                if self.stop_sweep:
+                    break
+                time.sleep(0.02)
+            if self.stop_sweep:
+                break
+            if direction > 0:
+                if val + step > end:
+                    break
+                val += step
+            else:
+                if val - step < end:
+                    break
+                val -= step
+        self.frame.after(0, self.stop_motor)
+
+    def update_telemetry(self, mid, rpm, amps):
+        if rpm is None:
+            return
+        self.telemetry[mid].append((time.time(), rpm, amps if amps is not None else 0.0))
+
+    def _compute_metrics(self, points):
+        if not self.step_active or int(self.var_motor.get()) != self.step_motor or not points:
+            return "Rise: --  Overshoot: --  Settling: --  SSE: --"
+        if abs(self.step_target) < 1e-6:
+            return "Rise: --  Overshoot: --  Settling: --  SSE: --"
+
+        post = [(t - self.step_t0, r) for (t, r, _a) in points if t >= self.step_t0]
+        if len(post) < 4:
+            return "Rise: --  Overshoot: --  Settling: --  SSE: --"
+
+        times = [p[0] for p in post]
+        vals = [p[1] for p in post]
+        target_abs = abs(self.step_target)
+        norm = [math.copysign(v, self.step_target) for v in vals]
+
+        y10 = 0.1 * target_abs
+        y90 = 0.9 * target_abs
+        t10 = next((t for t, y in zip(times, norm) if y >= y10), None)
+        t90 = next((t for t, y in zip(times, norm) if y >= y90), None)
+        rise = (t90 - t10) if (t10 is not None and t90 is not None and t90 >= t10) else None
+
+        peak = max(norm)
+        overshoot = max(0.0, (peak - target_abs) / target_abs * 100.0)
+
+        band = 0.05 * target_abs
+        settling = None
+        for i in range(len(norm)):
+            if all(abs(target_abs - y) <= band for y in norm[i:]):
+                settling = times[i]
+                break
+
+        recent = [target_abs - y for (t, y) in zip(times, norm) if times[-1] - t <= 1.0]
+        sse = (sum(recent) / len(recent)) if recent else None
+
+        fmt = lambda v, u: "--" if v is None else f"{v:.3f}{u}"
+        return (
+            f"Rise: {fmt(rise, 's')}  Overshoot: {overshoot:.1f}%  "
+            f"Settling: {fmt(settling, 's')}  SSE: {fmt(sse, ' rpm')}"
+        )
+
+    def _update_plot(self):
+        mid = int(self.var_motor.get())
+        points = list(self.telemetry.get(mid, []))
+        if points:
+            t_ref = points[-1][0]
+            x = [t - t_ref for (t, _r, _a) in points]
+            y_r = [r for (_t, r, _a) in points]
+            y_a = [a for (_t, _r, a) in points]
+            y_t = [self.step_target if self.step_active and self.step_motor == mid else 0.0 for _ in x]
+            self.line_rpm.set_data(x, y_r)
+            self.line_cur.set_data(x, y_a)
+            self.line_target.set_data(x, y_t)
+            self.ax_rpm.set_xlim(min(x), 0.0)
+            y_all = y_r + y_t
+            ymin = min(y_all) if y_all else -1.0
+            ymax = max(y_all) if y_all else 1.0
+            span = max(20.0, ymax - ymin)
+            self.ax_rpm.set_ylim(ymin - 0.2 * span, ymax + 0.2 * span)
+            amin = min(y_a) if y_a else -1.0
+            amax = max(y_a) if y_a else 1.0
+            aspan = max(1.0, amax - amin)
+            self.ax_cur.set_ylim(amin - 0.2 * aspan, amax + 0.2 * aspan)
+            self.lbl_metrics.config(text=self._compute_metrics(points))
+        else:
+            self.line_rpm.set_data([], [])
+            self.line_cur.set_data([], [])
+            self.line_target.set_data([], [])
+            self.lbl_metrics.config(text="Rise: --  Overshoot: --  Settling: --  SSE: --")
+
+        self.canvas.draw_idle()
+        self.frame.after(120, self._update_plot)
 
 class PIDTunerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("RoboMaster PID & Configuration Tuner")
         self.root.geometry("800x650")
-        
+
         self.config = self.load_config()
         self.ser = None
         self.tabs = {}
+        self.latest_telemetry = {str(i): {"pos": None, "rpm": None, "apos": None, "amps": None, "time": 0.0} for i in range(1, 9)}
         self.running = True
-        
+        self.cmd_queue = queue.Queue()
+
         self.create_widgets()
-        
+        threading.Thread(target=self.command_tx_loop, daemon=True).start()
+
+    def _sanitize_motor_config(self, raw_motor, default_motor):
+        cfg = dict(default_motor)
+        if isinstance(raw_motor, dict):
+            cfg.update(raw_motor)
+
+        # Numeric sanitization so bad saved values do not brick runtime control.
+        for key in ("gear_ratio", "kp", "ki", "kd", "aol", "skp", "ski", "skd", "sol", "min_angle", "max_angle", "zero_offset", "abs_zero_offset"):
+            try:
+                cfg[key] = float(cfg.get(key, default_motor.get(key, 0.0)))
+            except Exception:
+                cfg[key] = float(default_motor.get(key, 0.0))
+
+        if cfg["gear_ratio"] <= 0:
+            cfg["gear_ratio"] = float(default_motor["gear_ratio"])
+        if cfg["aol"] <= 0:
+            cfg["aol"] = float(default_motor["aol"])
+        if cfg["sol"] <= 0:
+            cfg["sol"] = float(default_motor["sol"])
+        if cfg["skp"] < 0.05:
+            cfg["skp"] = float(default_motor["skp"])
+        if cfg["max_angle"] <= cfg["min_angle"]:
+            cfg["min_angle"] = 0.0
+            cfg["max_angle"] = 360.0
+
+        if cfg.get("type") not in ("M2006", "M3508"):
+            cfg["type"] = default_motor["type"]
+
+        enc_idx = cfg.get("abs_encoder_index", None)
+        if enc_idx is None or enc_idx == "None":
+            cfg["abs_encoder_index"] = None
+        else:
+            try:
+                cfg["abs_encoder_index"] = int(enc_idx)
+            except Exception:
+                cfg["abs_encoder_index"] = None
+        if cfg["abs_encoder_index"] is not None and (cfg["abs_encoder_index"] < 0 or cfg["abs_encoder_index"] > 7):
+            cfg["abs_encoder_index"] = None
+
+        try:
+            cfg["abs_encoder_reversed"] = bool(cfg.get("abs_encoder_reversed", True))
+        except Exception:
+            cfg["abs_encoder_reversed"] = True
+
+        try:
+            cfg["abs_pid_enabled"] = bool(cfg.get("abs_pid_enabled", False))
+        except Exception:
+            cfg["abs_pid_enabled"] = False
+
+        return cfg
+
+    def _sanitize_config(self, loaded):
+        out = {"motors": {}, "wrist_differential": json.loads(json.dumps(DEFAULT_CONFIG["wrist_differential"]))}
+        loaded_motors = loaded.get("motors", {}) if isinstance(loaded, dict) else {}
+        for i in range(1, 7):
+            mid = str(i)
+            default_motor = DEFAULT_CONFIG["motors"][mid]
+            raw_motor = loaded_motors.get(mid, {}) if isinstance(loaded_motors, dict) else {}
+            out["motors"][mid] = self._sanitize_motor_config(raw_motor, default_motor)
+        loaded_wrist = loaded.get("wrist_differential", {}) if isinstance(loaded, dict) else {}
+        if isinstance(loaded_wrist, dict):
+            out["wrist_differential"].update({k: v for k, v in loaded_wrist.items() if k not in {"mix", "pid"}})
+            if isinstance(loaded_wrist.get("mix"), dict):
+                out["wrist_differential"]["mix"].update(loaded_wrist["mix"])
+            if isinstance(loaded_wrist.get("pid"), dict):
+                out["wrist_differential"]["pid"].update(loaded_wrist["pid"])
+        return out
+
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                return self._sanitize_config(loaded)
             except Exception as e:
                 messagebox.showwarning("Warning", f"Failed to load config: {e}\nUsing defaults.")
-        return DEFAULT_CONFIG.copy()
+        return self._sanitize_config(DEFAULT_CONFIG)
 
     def save_config(self):
         try:
@@ -383,6 +1152,14 @@ class PIDTunerApp:
         self.btn_connect.pack(side="right")
         self.lbl_status = ttk.Label(top_frame, text="Disconnected", foreground="red")
         self.lbl_status.pack(side="right", padx=10)
+
+        quick_frame = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        quick_frame.pack(fill="x", side="top")
+        ttk.Button(quick_frame, text="Safe Bring-Up", command=self.safe_bringup).pack(side="left", padx=4)
+        ttk.Button(quick_frame, text="STOP ALL", command=lambda: self.send_command("S")).pack(side="left", padx=4)
+        ttk.Button(quick_frame, text="Apply Limits Only", command=self.apply_limits_all).pack(side="left", padx=4)
+        ttk.Button(quick_frame, text="Load Conservative All", command=lambda: self.load_preset_all("Conservative")).pack(side="left", padx=4)
+        ttk.Button(quick_frame, text="Apply Encoder Mappings", command=self.apply_encoder_mappings).pack(side="left", padx=4)
 
         # --- Scrollable canvas fills remaining space ---
         scroll_container = ttk.Frame(self.root)
@@ -427,6 +1204,17 @@ class PIDTunerApp:
             self.tabs[mid] = tab
             self.notebook.add(tab.frame, text=f"Motor {mid}")
 
+        # --- Wrist Diagnostics Tab ---
+        self.wrist_tab = WristDiagnosticsTab(self.notebook)
+        self.notebook.add(self.wrist_tab.frame, text="Wrist Diagnostics")
+
+        self.wrist_tuning_tab = WristTuningTab(self.notebook, self, self.config["wrist_differential"], self.send_command)
+        self.notebook.add(self.wrist_tuning_tab.frame, text="Wrist Tuning")
+
+        # --- Integrated Speed PID Tuner Tab ---
+        self.speed_tuner_tab = SpeedTunerTab(self.notebook, self.send_command)
+        self.notebook.add(self.speed_tuner_tab.frame, text="Speed Tuner")
+
         # --- Serial log (also scrollable with the page) ---
         lf_log = ttk.LabelFrame(content, text="Serial Log", padding=5)
         lf_log.pack(fill="x", padx=10, pady=(0, 10))
@@ -447,6 +1235,7 @@ class PIDTunerApp:
         self.log_box.tag_config("info",      foreground="#b5cea8")
         self.log_box.tag_config("sent",      foreground="#dca54e")
         self._log_line_count = 0
+
     def find_serial_port(self):
         ports = serial.tools.list_ports.comports()
         for port in ports:
@@ -454,38 +1243,63 @@ class PIDTunerApp:
                 return port.device
         return ports[0].device if ports else None
 
+    def disconnect_serial(self):
+        """Helper to cleanly update the UI when the serial connection is lost or closed."""
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+                self.cmd_queue.task_done()
+            except Exception:
+                break
+        self.btn_connect.config(text="Connect to Arm")
+        self.lbl_status.config(text="Disconnected", foreground="red")
+        self.status_bar.config(text="Disconnected from serial.")
+
     def toggle_serial(self):
         if self.ser and self.ser.is_open:
-            self.ser.close()
-            self.ser = None
-            self.btn_connect.config(text="Connect to Arm")
-            self.lbl_status.config(text="Disconnected", foreground="red")
-            self.status_bar.config(text="Disconnected from serial.")
+            self.disconnect_serial()
         else:
             port = self.find_serial_port()
             if not port:
                 messagebox.showerror("No Device", "Could not find a connected Arduino device.")
                 return
-                
+
             try:
                 self.ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
                 time.sleep(2)
                 self.btn_connect.config(text="Disconnect")
                 self.lbl_status.config(text=f"Connected ({port})", foreground="green")
                 self.status_bar.config(text=f"Connected successfully to {port} @ {BAUD_RATE} baud.")
-                
+
                 # Start background serial read thread first
                 threading.Thread(target=self.serial_read_loop, daemon=True).start()
                 time.sleep(0.15)  # Give thread a moment to start
-                
-                # TON is idempotent (unlike T toggle) — safe to call on every connect
+
+                # TON is idempotent (unlike T toggle) - safe to call on every connect
                 self.send_command("TON")
-                
-                # Auto-apply saved configuration so Arduino matches the saved PID/limits
-                time.sleep(0.1)
-                self.apply_all()
+
+                # Do not auto-apply file settings on connect.
+                # Bad saved values can make motors appear dead until power cycle.
+                self.status_bar.config(text=f"Connected to {port}. Live control ready. Use 'Apply ALL' only after reviewing values.")
+
             except Exception as e:
                 messagebox.showerror("Connection Error", f"Could not connect to {port}:\n{e}")
+
+    @staticmethod
+    def _safe_float(value):
+        try:
+            f = float(value)
+        except Exception:
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
 
     def serial_read_loop(self):
         while self.running and self.ser and self.ser.is_open:
@@ -494,43 +1308,130 @@ class PIDTunerApp:
                     line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                     if not line:
                         continue
-                    
+
                     # Append raw line to the log panel (thread-safe)
                     self.root.after(0, self.log_append, line)
-                        
-                    # Parse status "M1 POS:0.0 Tot:0.0 RPM:0.0 A:0.00 |"
-                    # We can use regex or simple splits
+
+                    # Keep target labels synced even when commands originate
+                    # outside this app (e.g. IK tool / serial monitor).
+                    m_pr = re.search(r"^M(\d+)\s+PR\s+[-+]?\d*\.?\d+\s+->\s+log\s+([-+]?\d*\.?\d+)", line)
+                    if m_pr:
+                        mid = m_pr.group(1)
+                        tgt = self._safe_float(m_pr.group(2))
+                        if tgt is not None:
+                            self.root.after(0, self._set_target_from_firmware, mid, tgt)
+                        continue
+
+                    m_p = re.search(r"^M(\d+)\s+->\s+log\s+([-+]?\d*\.?\d+)", line)
+                    if m_p:
+                        mid = m_p.group(1)
+                        tgt = self._safe_float(m_p.group(2))
+                        if tgt is not None:
+                            self.root.after(0, self._set_target_from_firmware, mid, tgt)
+                        continue
+
+                    if line.startswith("STOPPED ALL MOTORS"):
+                        self.root.after(0, self._sync_targets_to_current)
+                        continue
+
+                    # Parse status lines like:
+                    # M1 POS:0.0 APOS:45.3 Tot:0.0 RPM:0.0 A:0.00 |
                     for token in line.split("|"):
                         token = token.strip()
-                        if token.startswith("M"):
-                            match = re.search(r"M(\d+)\s+POS:([-\d.]+).*?RPM:([-\d.]+)", token)
-                            if match:
-                                mid = match.group(1)
-                                pos = match.group(2)
-                                rpm = match.group(3)
-                                # Capture optional APOS (absolute encoder)
-                                apos_match = re.search(r"APOS:([-\d.]+)", token)
-                                apos = apos_match.group(1) if apos_match else None
-                                if mid in self.tabs:
-                                    self.root.after(0, self.update_telemetry_ui, mid, pos, rpm, apos)
-                                    
+                        if not token.startswith("M"):
+                            continue
+                        if ("POS:" not in token) and ("RPM:" not in token) and ("APOS:" not in token):
+                            continue
+
+                        mid_m = re.search(r"M(\d+)", token)
+                        if not mid_m:
+                            continue
+
+                        pos_m = re.search(r"POS:([^\s|]+)", token)
+                        apos_m = re.search(r"APOS:([^\s|]+)", token)
+                        rpm_m = re.search(r"RPM:([^\s|]+)", token)
+                        amp_m = re.search(r"A:([^\s|]+)", token)
+
+                        mid = mid_m.group(1)
+                        pos = pos_m.group(1) if pos_m else None
+                        apos = apos_m.group(1) if apos_m else None
+                        rpm = rpm_m.group(1) if rpm_m else None
+                        amps = amp_m.group(1) if amp_m else None
+
+                        self.root.after(0, self.update_telemetry_ui, mid, pos, rpm, apos, amps)
                 time.sleep(0.01)
+            except (serial.SerialException, OSError) as e:
+                # Device was likely disconnected (e.g. unplugged USB)
+                self.root.after(0, self.status_bar.config, {"text": f"Serial port lost: {e}"})
+                self.root.after(0, self.disconnect_serial)
+                break
             except Exception:
                 break
-                
-    def update_telemetry_ui(self, mid, pos, rpm="---", apos=None):
+
+    def update_telemetry_ui(self, mid, pos, rpm="---", apos=None, amps=None):
+        pos_f = self._safe_float(pos) if pos is not None else None
+        rpm_f = self._safe_float(rpm) if rpm is not None else None
+        apos_f = self._safe_float(apos) if apos is not None else None
+        amp_f = self._safe_float(amps) if amps is not None else None
+        self.latest_telemetry[str(mid)] = {"pos": pos_f, "rpm": rpm_f, "apos": apos_f, "amps": amp_f, "time": time.time()}
+
         if mid in self.tabs:
             tab = self.tabs[mid]
-            tab.lbl_current_angle.config(text=f"{pos}°")
-            tab.lbl_current_rpm.config(text=f"{rpm} RPM")
-            if apos is not None:
-                tab.lbl_abs_angle.config(text=f"{apos}°")
+            tab._last_telemetry_time = time.time()
+
+            tab.lbl_current_angle.config(text=(f"{pos_f:.1f}°" if pos_f is not None else "N/A"), foreground="blue")
+            tab.lbl_current_rpm.config(text=(f"{rpm_f:.1f} RPM" if rpm_f is not None else "N/A"), foreground="green")
+
+            if apos_f is not None:
+                tab.lbl_abs_pos.config(text=f"{apos_f:.1f}°", foreground="orange")
+                tab._gauge_abs_deg = apos_f
             else:
-                tab.lbl_abs_angle.config(text="N/A")
+                tab.lbl_abs_pos.config(text="N/A", foreground="orange")
+                tab._gauge_abs_deg = None
+
+            if pos_f is not None:
+                tab._gauge_current_deg = pos_f
+
+            if mid == "5":
+                self.wrist_tab.m5_apos = apos_f
+                self.wrist_tab.update_values()
+            elif mid == "6":
+                self.wrist_tab.m6_apos = apos_f
+                self.wrist_tab.update_values()
+
+        if hasattr(self, "wrist_tuning_tab"):
+            self.wrist_tuning_tab.update_values(self.get_wrist_telemetry_snapshot())
+
+        if hasattr(self, "speed_tuner_tab"):
             try:
-                tab._gauge_current_deg = float(pos)
-            except ValueError:
+                self.speed_tuner_tab.update_telemetry(int(mid), rpm_f, amp_f)
+            except Exception:
                 pass
+
+    def get_wrist_telemetry_snapshot(self):
+        cfg = self.config.get("wrist_differential", {})
+        pitch_mid = str(int(cfg.get("pitch_encoder_motor_id", 5)))
+        roll_mid = str(int(cfg.get("roll_encoder_motor_id", 6)))
+        pitch_joint = str(int(cfg.get("pitch_joint_id", 5)))
+        roll_joint = str(int(cfg.get("roll_joint_id", 6)))
+        pitch_raw = self.latest_telemetry.get(pitch_mid, {}).get("apos")
+        roll_raw = self.latest_telemetry.get(roll_mid, {}).get("apos")
+        pitch_zero = float(self.config.get("motors", {}).get(pitch_joint, {}).get("abs_zero_offset", 0.0))
+        roll_zero = float(self.config.get("motors", {}).get(roll_joint, {}).get("abs_zero_offset", 0.0))
+        pitch = None if pitch_raw is None else pitch_raw - pitch_zero
+        roll = None if roll_raw is None else roll_raw - roll_zero
+        pitch_target = self.tabs.get(pitch_joint).target_deg if self.tabs.get(pitch_joint) else None
+        roll_target = self.tabs.get(roll_joint).target_deg if self.tabs.get(roll_joint) else None
+        motor_a_mid = str(int(cfg.get("motor_a_id", 5)))
+        motor_b_mid = str(int(cfg.get("motor_b_id", 6)))
+        return {
+            "pitch": pitch,
+            "roll": roll,
+            "pitch_target": pitch_target,
+            "roll_target": roll_target,
+            "motor_a_cmd": self.latest_telemetry.get(motor_a_mid, {}).get("rpm"),
+            "motor_b_cmd": self.latest_telemetry.get(motor_b_mid, {}).get("rpm"),
+        }
 
     def clear_log(self):
         self.log_box.config(state="normal")
@@ -555,14 +1456,119 @@ class PIDTunerApp:
         self.log_box.see("end")
         self.log_box.config(state="disabled")
 
+    def _resolve_target_motors(self, motor_tok):
+        tok = motor_tok.strip()
+        if tok == "*":
+            return list(self.tabs.keys())
+        return [tok] if tok in self.tabs else []
+
+    def _set_target_from_firmware(self, mid, logical_deg):
+        tab = self.tabs.get(str(mid))
+        if not tab:
+            return
+        tab._set_target_display(logical_deg, reference=tab._gauge_current_deg)
+
+    def _sync_targets_to_current(self):
+        for tab in self.tabs.values():
+            if tab._gauge_current_deg is not None:
+                tab._set_target_display(tab._gauge_current_deg)
+
+    def _estimate_target_base(self, tab):
+        if tab._gauge_current_deg is not None:
+            return tab._gauge_current_deg
+        if tab.target_deg is not None:
+            return tab.target_deg
+        return 0.0
+
+    @staticmethod
+    def _is_motion_command(cmd):
+        motion_ops = {"S", "P", "PR", "M", "MV", "CAL", "JLIM"}
+        for part in [p.strip() for p in cmd.split(";") if p.strip()]:
+            op = part.split()[0].upper() if part.split() else ""
+            if op in motion_ops:
+                return True
+        return False
+
+    def _clear_pending_commands(self):
+        while not self.cmd_queue.empty():
+            try:
+                self.cmd_queue.get_nowait()
+                self.cmd_queue.task_done()
+            except Exception:
+                break
+
+    def _update_target_labels_from_cmd(self, cmd):
+        parts = [p.strip() for p in cmd.split(";") if p.strip()]
+        for part in parts:
+            toks = part.split()
+            if len(toks) < 1:
+                continue
+            op = toks[0].upper()
+
+            if op == "P" and len(toks) >= 3:
+                angle = self._safe_float(toks[2])
+                if angle is None:
+                    continue
+                for mid in self._resolve_target_motors(toks[1]):
+                    tab = self.tabs[mid]
+                    tab._set_target_display(angle, reference=self._estimate_target_base(tab))
+            elif op == "PR" and len(toks) >= 3:
+                delta = self._safe_float(toks[2])
+                if delta is None:
+                    continue
+                for mid in self._resolve_target_motors(toks[1]):
+                    tab = self.tabs[mid]
+                    base = self._estimate_target_base(tab)
+                    tab._set_target_display(base + delta, reference=base)
+            elif op == "CAL" and len(toks) >= 3:
+                angle = self._safe_float(toks[2])
+                if angle is None:
+                    continue
+                for mid in self._resolve_target_motors(toks[1]):
+                    self.tabs[mid]._set_target_display(angle, reference=angle)
+            elif op == "JLIM" and len(toks) >= 4:
+                for mid in self._resolve_target_motors(toks[1]):
+                    tab = self.tabs[mid]
+                    if tab.target_deg is not None:
+                        tab._set_target_display(tab.target_deg, reference=tab._gauge_current_deg)
+            elif op == "M" and len(toks) >= 3:
+                speed = self._safe_float(toks[2])
+                if speed is None or abs(speed) >= 1.0:
+                    continue
+                for mid in self._resolve_target_motors(toks[1]):
+                    tab = self.tabs[mid]
+                    if tab._gauge_current_deg is not None:
+                        tab._set_target_display(tab._gauge_current_deg)
+            elif op == "S":
+                for tab in self.tabs.values():
+                    if tab._gauge_current_deg is not None:
+                        tab._set_target_display(tab._gauge_current_deg)
+
+    def command_tx_loop(self):
+        while self.running:
+            try:
+                cmd = self.cmd_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if self.ser and self.ser.is_open:
+                    self.ser.write((cmd + '\n').encode('utf-8'))
+                time.sleep(0.015)
+            except Exception:
+                pass
+            finally:
+                self.cmd_queue.task_done()
+
     def send_command(self, cmd):
         if self.ser and self.ser.is_open:
             try:
-                self.ser.write((cmd + '\n').encode('utf-8'))
-                self.status_bar.config(text=f"Sent: {cmd}")
-                self.root.after(0, self._log_sent, cmd)
+                if self._is_motion_command(cmd):
+                    self._clear_pending_commands()
+                self._update_target_labels_from_cmd(cmd)
+                self.cmd_queue.put(cmd)
+                self.status_bar.config(text=f"Queued: {cmd}")
             except Exception as e:
-                messagebox.showerror("Serial Error", f"Failed to send data:\n{e}")
+                messagebox.showerror("Serial Error", f"Failed to queue command:\n{e}")
                 self.toggle_serial()
         else:
             self.status_bar.config(text=f"Not connected! (Would have sent: {cmd})")
@@ -581,11 +1587,16 @@ class PIDTunerApp:
         if not self.ser or not self.ser.is_open:
             messagebox.showwarning("Not Connected", "Please connect to the arm first to apply settings alive.")
             return
-            
+
         for mid, tab in self.tabs.items():
             # Batch all commands for this motor into one semicolon-separated string
             gr   = tab.config.get("gear_ratio", 1.0)
             mn   = tab.var_min.get(); mx = tab.var_max.get()
+            if mx <= mn:
+                mn, mx = 0.0, 360.0
+                tab.var_min.set(mn)
+                tab.var_max.set(mx)
+                tab.on_change()
             kp   = tab.var_kp.get();  ki  = tab.var_ki.get();  kd  = tab.var_kd.get();  aol = tab.var_aol.get()
             skp  = tab.var_skp.get(); ski = tab.var_ski.get(); skd = tab.var_skd.get(); sol = tab.var_sol.get()
             batch = (
@@ -596,8 +1607,127 @@ class PIDTunerApp:
             )
             self.send_command(batch)
             time.sleep(0.05)
-            
+
+        self.apply_encoder_mappings(show_status=False)
+        self.apply_wrist_settings(show_status=False)
+        for mid, tab in self.tabs.items():
+            enable = 1 if bool(tab.config.get("abs_pid_enabled", False)) else 0
+            if self.config.get("wrist_differential", {}).get("enabled", False) and mid in {
+                str(int(self.config["wrist_differential"].get("pitch_joint_id", 5))),
+                str(int(self.config["wrist_differential"].get("roll_joint_id", 6)))
+            }:
+                enable = 0
+            self.send_command(f"ABSPID {mid} {enable}")
+            time.sleep(0.02)
+
         self.status_bar.config(text="All Gear Ratios and PIDs applied to Arm!")
+
+    def apply_encoder_mappings(self, show_status=True):
+        if not self.ser or not self.ser.is_open:
+            if show_status:
+                messagebox.showwarning("Not Connected", "Please connect to the arm first.")
+            return
+
+        desired_by_enc = {}
+        duplicates = []
+        for mid, tab in self.tabs.items():
+            tab.on_change()
+            enc_idx = tab.config.get("abs_encoder_index")
+            if enc_idx is None:
+                continue
+            try:
+                enc_i = int(enc_idx)
+            except Exception:
+                continue
+            if enc_i in desired_by_enc and desired_by_enc[enc_i] != int(mid):
+                duplicates.append(enc_i)
+            desired_by_enc[enc_i] = int(mid)
+
+        if duplicates and show_status:
+            messagebox.showwarning("Encoder Mapping", f"Multiple motors selected the same encoder index: {sorted(set(duplicates))}. Last one wins.")
+
+        max_encoder_index = -1
+        for tab in self.tabs.values():
+            enc_idx = tab.config.get("abs_encoder_index")
+            if enc_idx is None:
+                continue
+            try:
+                max_encoder_index = max(max_encoder_index, int(enc_idx))
+            except Exception:
+                continue
+        encoder_slots = max(2, max_encoder_index + 1)
+
+        for e in range(encoder_slots):
+            self.send_command(f"ENCMAP {e} 0")
+            time.sleep(0.01)
+
+        for mid, tab in self.tabs.items():
+            enc_idx = tab.config.get("abs_encoder_index")
+            if enc_idx is None:
+                continue
+            try:
+                enc_i = int(enc_idx)
+            except Exception:
+                continue
+            self.send_command(f"ENCMAP {enc_i} {int(mid)}")
+            time.sleep(0.02)
+
+        if show_status:
+            self.status_bar.config(text="Applied absolute encoder mappings to arm.")
+
+    def apply_wrist_settings(self, show_status=True):
+        if hasattr(self, "wrist_tuning_tab"):
+            self.wrist_tuning_tab.on_change()
+        if not self.ser or not self.ser.is_open:
+            if show_status:
+                messagebox.showwarning("Not Connected", "Please connect to the arm first.")
+            return
+        cfg = self.config.get("wrist_differential", {})
+        pitch_enc = cfg.get("pitch_encoder_index")
+        roll_enc = cfg.get("roll_encoder_index")
+        pitch_mid = int(cfg.get("pitch_encoder_motor_id", 5))
+        roll_mid = int(cfg.get("roll_encoder_motor_id", 6))
+        if pitch_enc is not None:
+            self.send_command(f"ENCMAP {int(pitch_enc)} 0")
+            time.sleep(0.01)
+            self.send_command(f"ENCMAP {int(pitch_enc)} {pitch_mid}")
+            time.sleep(0.02)
+        if roll_enc is not None:
+            self.send_command(f"ENCMAP {int(roll_enc)} 0")
+            time.sleep(0.01)
+            self.send_command(f"ENCMAP {int(roll_enc)} {roll_mid}")
+            time.sleep(0.02)
+        for joint_mid in (int(cfg.get("pitch_joint_id", 5)), int(cfg.get("roll_joint_id", 6))):
+            self.send_command(f"ABSPID {joint_mid} 0")
+            time.sleep(0.02)
+        if show_status:
+            self.status_bar.config(text="Applied wrist differential config and encoder mappings.")
+
+    def load_preset_all(self, preset_name):
+        for tab in self.tabs.values():
+            tab.var_preset.set(preset_name)
+            tab.load_selected_preset()
+        self.status_bar.config(text=f"Loaded '{preset_name}' preset into all motor tabs. Review, then Apply.")
+
+    def apply_limits_all(self):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Not Connected", "Please connect to the arm first.")
+            return
+        for mid, tab in self.tabs.items():
+            mn = tab.var_min.get()
+            mx = tab.var_max.get()
+            if mx <= mn:
+                continue
+            self.send_command(f"JLIM {mid} {mn:.1f} {mx:.1f}")
+            time.sleep(0.03)
+        self.status_bar.config(text="Applied all joint limits to arm.")
+
+    def safe_bringup(self):
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Not Connected", "Please connect to the arm first.")
+            return
+        self.send_command("S; TON")
+        self.status_bar.config(text="Safe bring-up sent: STOP + telemetry ON.")
 
     def on_close(self):
         self.running = False
@@ -609,13 +1739,13 @@ if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'w') as f:
             json.dump(DEFAULT_CONFIG, f, indent=4)
-            
+
     root = tk.Tk()
     app = PIDTunerApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
-    
+
     root.lift()
     root.attributes('-topmost',True)
     root.after_idle(root.attributes,'-topmost',False)
-    
+
     root.mainloop()

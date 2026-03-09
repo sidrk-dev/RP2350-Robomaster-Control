@@ -11,9 +11,12 @@ import traceback
 import tempfile
 import os
 import json
+import re
+import queue
 
 CONFIG_FILE = "robot_config.json"
 robot_config = {}
+wrist_diff_config = {}
 
 try:
     from ikpy.chain import Chain
@@ -41,6 +44,11 @@ for key in list(plt.rcParams.keys()):
 
 # --- Globals ---
 ser = None
+read_thread = None
+tx_thread = None
+wrist_diff_thread = None
+serial_running = True
+cmd_queue = queue.Queue()
 my_chain = None
 current_target_xyz = [0.2, 0.0, 0.3]  # Default safe position
 current_target_rpy = [0.0, 0.0, 0.0]  # Roll, Pitch, Yaw
@@ -50,9 +58,20 @@ is_previewing = False
 preview_start_time = 0
 PREVIEW_DURATION = 2.5 # seconds for preview animation
 live_update = False
+sync_model_to_telemetry = True
 last_send_time = 0
+
+PLANAR_MODE = True
+PLANAR_ACTIVE_MOTORS = {2, 3}
+LOCKED_MOTORS = {1, 4, 5, 6}
+LOCKED_BOUNDS_EPS_RAD = 1e-4
+DEFAULT_IK_ZERO_OFFSETS = {3: -90.0}
+locked_joint_rads = {mid: 0.0 for mid in range(1, 7)}
+planar_target_y = 0.0
+
 cam_elev = 20.0
 cam_azim = -60.0
+DISPLAY_MIRROR_X = True
 arm_line = None
 ghost_line = None
 target_point = None
@@ -66,6 +85,668 @@ target_point_side = None
 ax_top = None
 ax_side = None
 
+txt_joint_dashboard = None
+btn_connection = None
+txt_connection_status = None
+
+# --- Safety Controls ---
+FULL_RANGE_EPS = 359.5
+MAX_COMMAND_STEP_DEG = 6.0
+MAX_COMMAND_RATE_DEG_PER_SEC = 120.0
+COMMAND_DEADBAND_DEG = 0.20
+RAMP_INTERVAL_SEC = 0.03
+RECENT_COMMAND_HOLD_SEC = 0.35
+
+last_sent_logical_deg = {i: None for i in range(1, 7)}
+latest_motor_pos_deg = {}
+latest_motor_apos_deg = {}
+latest_motor_telemetry_time = {}
+last_command_wall_time = 0.0
+last_serial_command = ""
+last_serial_command_time = 0.0
+serial_command_count = 0
+last_telemetry_line = ""
+wrist_diff_target_logical_deg = {"pitch": None, "roll": None}
+wrist_diff_pid_state = {
+    "pitch": {"integral": 0.0, "prev_error": 0.0},
+    "roll": {"integral": 0.0, "prev_error": 0.0},
+}
+wrist_diff_last_update_time = 0.0
+wrist_diff_last_motor_cmd = (None, None)
+
+TELEMETRY_STALE_SEC = 1.0
+AUTO_MOVE_TO_ZERO_ON_CONNECT = True
+AUTO_MOVE_TO_ZERO_WAIT_SEC = 1.5
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _get_zero_offset(mid):
+    try:
+        return float(robot_config.get(str(mid), {}).get("zero_offset", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _get_wrist_diff_defaults():
+    return {
+        "enabled": False,
+        "pitch_joint_id": 5,
+        "roll_joint_id": 6,
+        "pitch_encoder_index": None,
+        "roll_encoder_index": None,
+        "pitch_encoder_motor_id": 5,
+        "roll_encoder_motor_id": 6,
+        "motor_a_id": 5,
+        "motor_b_id": 6,
+        "mix": {
+            "motor_a_pitch_sign": 1.0,
+            "motor_a_roll_sign": 1.0,
+            "motor_b_pitch_sign": 1.0,
+            "motor_b_roll_sign": -1.0,
+        },
+        "pid": {
+            "pitch_kp": 4.0,
+            "pitch_ki": 0.0,
+            "pitch_kd": 0.0,
+            "roll_kp": 4.0,
+            "roll_ki": 0.0,
+            "roll_kd": 0.0,
+            "max_axis_speed": 80.0,
+            "max_motor_speed": 120.0,
+            "deadband_deg": 0.4,
+            "integral_limit": 30.0,
+        },
+    }
+
+
+def get_wrist_diff_config():
+    cfg = _get_wrist_diff_defaults()
+    if not isinstance(wrist_diff_config, dict):
+        return cfg
+    cfg.update({k: v for k, v in wrist_diff_config.items() if k not in {"mix", "pid"}})
+    mix = dict(cfg["mix"])
+    if isinstance(wrist_diff_config.get("mix"), dict):
+        mix.update(wrist_diff_config.get("mix", {}))
+    cfg["mix"] = mix
+    pid = dict(cfg["pid"])
+    if isinstance(wrist_diff_config.get("pid"), dict):
+        pid.update(wrist_diff_config.get("pid", {}))
+    cfg["pid"] = pid
+    return cfg
+
+
+def wrist_diff_enabled():
+    cfg = get_wrist_diff_config()
+    return bool(cfg.get("enabled", False))
+
+
+def wrist_diff_joint_ids():
+    cfg = get_wrist_diff_config()
+    return int(cfg.get("pitch_joint_id", 5)), int(cfg.get("roll_joint_id", 6))
+
+
+def wrist_diff_motor_ids():
+    cfg = get_wrist_diff_config()
+    return int(cfg.get("motor_a_id", 5)), int(cfg.get("motor_b_id", 6))
+
+
+def wrist_diff_encoder_motor_id(axis_name):
+    cfg = get_wrist_diff_config()
+    if axis_name == "pitch":
+        return int(cfg.get("pitch_encoder_motor_id", 5))
+    return int(cfg.get("roll_encoder_motor_id", 6))
+
+
+def wrist_diff_joint_id_for_axis(axis_name):
+    pitch_joint_id, roll_joint_id = wrist_diff_joint_ids()
+    return pitch_joint_id if axis_name == "pitch" else roll_joint_id
+
+
+def reset_wrist_diff_pid_state():
+    global wrist_diff_last_update_time, wrist_diff_last_motor_cmd
+    for axis_name in ("pitch", "roll"):
+        wrist_diff_pid_state[axis_name]["integral"] = 0.0
+        wrist_diff_pid_state[axis_name]["prev_error"] = 0.0
+    wrist_diff_last_update_time = 0.0
+    wrist_diff_last_motor_cmd = (None, None)
+
+
+def clear_wrist_diff_targets(send_stop=False):
+    wrist_diff_target_logical_deg["pitch"] = None
+    wrist_diff_target_logical_deg["roll"] = None
+    reset_wrist_diff_pid_state()
+    if send_stop and ser and ser.is_open and wrist_diff_enabled():
+        motor_a_id, motor_b_id = wrist_diff_motor_ids()
+        send_command(f"M {motor_a_id} 0; M {motor_b_id} 0")
+
+
+def set_wrist_diff_targets(pitch_target_deg=None, roll_target_deg=None):
+    if pitch_target_deg is not None:
+        wrist_diff_target_logical_deg["pitch"] = float(pitch_target_deg)
+    if roll_target_deg is not None:
+        wrist_diff_target_logical_deg["roll"] = float(roll_target_deg)
+    reset_wrist_diff_pid_state()
+
+
+def get_wrist_output_logical_deg(axis_name):
+    motor_id = wrist_diff_encoder_motor_id(axis_name)
+    apos = latest_motor_apos_deg.get(int(motor_id))
+    if apos is None:
+        return None
+    joint_id = wrist_diff_joint_id_for_axis(axis_name)
+    return float(apos) - _get_abs_zero_offset(joint_id)
+
+
+def _get_abs_zero_offset(mid):
+    try:
+        return float(robot_config.get(str(mid), {}).get("abs_zero_offset", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _get_ik_zero_offset(mid):
+    try:
+        cfg = robot_config.get(str(mid), {})
+        if "ik_zero_offset" in cfg:
+            return float(cfg.get("ik_zero_offset", 0.0))
+        if int(mid) in DEFAULT_IK_ZERO_OFFSETS:
+            return float(DEFAULT_IK_ZERO_OFFSETS[int(mid)])
+        return float(cfg.get("zero_offset", 0.0))
+    except Exception:
+        return 0.0
+
+
+def get_current_logical_deg_from_apos(mid):
+    if wrist_diff_enabled():
+        pitch_joint_id, roll_joint_id = wrist_diff_joint_ids()
+        if int(mid) == pitch_joint_id:
+            return get_wrist_output_logical_deg("pitch")
+        if int(mid) == roll_joint_id:
+            return get_wrist_output_logical_deg("roll")
+    apos = latest_motor_apos_deg.get(int(mid))
+    if apos is None:
+        return None
+    return apos - _get_abs_zero_offset(mid)
+
+
+def get_current_ik_deg_from_apos(mid):
+    logical_deg = get_current_logical_deg_from_apos(mid)
+    if logical_deg is None:
+        return None
+    zoff = _get_ik_zero_offset(mid)
+    return logical_deg - zoff
+
+
+def clampf(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def wrap360f(angle):
+    while angle >= 360.0:
+        angle -= 360.0
+    while angle < 0.0:
+        angle += 360.0
+    return angle
+
+
+def nearest_equivalent(angle_deg, reference_deg):
+    turns = round((reference_deg - angle_deg) / 360.0)
+    return angle_deg + (turns * 360.0)
+
+
+def is_full_range(min_a, max_a):
+    return (max_a - min_a) >= FULL_RANGE_EPS
+
+
+def normalize_target_for_limits(target_deg, min_a, max_a, reference_deg=None):
+    if is_full_range(min_a, max_a):
+        return wrap360f(target_deg)
+    if min_a <= target_deg <= max_a:
+        return target_deg
+    if reference_deg is None:
+        reference_deg = (min_a + max_a) * 0.5
+    else:
+        reference_deg = clampf(reference_deg, min_a, max_a)
+    return clampf(nearest_equivalent(target_deg, reference_deg), min_a, max_a)
+
+
+def shortest_delta_deg(current_deg, target_deg):
+    delta = target_deg - current_deg
+    if delta > 180.0:
+        delta -= 360.0
+    if delta < -180.0:
+        delta += 360.0
+    return delta
+
+
+def get_motor_limits(mid):
+    cfg = robot_config.get(str(mid), {})
+    min_a = float(cfg.get("min_angle", 0.0))
+    max_a = float(cfg.get("max_angle", 360.0))
+    if max_a <= min_a:
+        min_a, max_a = 0.0, 360.0
+    return min_a, max_a
+
+
+def get_start_command_position(mid, target_deg):
+    prev = last_sent_logical_deg.get(mid)
+    if prev is not None and (time.time() - last_command_wall_time) < RECENT_COMMAND_HOLD_SEC:
+        return prev
+    tele = latest_motor_pos_deg.get(mid)
+    if tele is not None:
+        return tele
+    if prev is not None:
+        return prev
+    return target_deg
+
+
+def command_step_toward(mid, current_deg, target_deg, max_step_deg):
+    min_a, max_a = get_motor_limits(mid)
+    if is_full_range(min_a, max_a):
+        cur = wrap360f(current_deg)
+        tgt = wrap360f(target_deg)
+        delta = shortest_delta_deg(cur, tgt)
+        if abs(delta) <= max_step_deg:
+            return tgt, True
+        return wrap360f(cur + math.copysign(max_step_deg, delta)), False
+
+    cur = normalize_target_for_limits(current_deg, min_a, max_a, reference_deg=(min_a + max_a) * 0.5)
+    tgt = normalize_target_for_limits(target_deg, min_a, max_a, reference_deg=cur)
+    delta = tgt - cur
+    if abs(delta) <= max_step_deg:
+        return tgt, True
+    return cur + math.copysign(max_step_deg, delta), False
+
+
+def command_distance_deg(mid, a_deg, b_deg):
+    min_a, max_a = get_motor_limits(mid)
+    if is_full_range(min_a, max_a):
+        return abs(shortest_delta_deg(wrap360f(a_deg), wrap360f(b_deg)))
+    a_lim = normalize_target_for_limits(a_deg, min_a, max_a, reference_deg=(min_a + max_a) * 0.5)
+    b_lim = normalize_target_for_limits(b_deg, min_a, max_a, reference_deg=a_lim)
+    return abs(b_lim - a_lim)
+
+
+def load_robot_config():
+    global robot_config, wrist_diff_config
+    robot_config = {}
+    wrist_diff_config = {}
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            data = json.load(f)
+        motors = data.get("motors", {}) if isinstance(data, dict) else {}
+        if isinstance(motors, dict):
+            robot_config = motors
+        diff_cfg = data.get("wrist_differential", {}) if isinstance(data, dict) else {}
+        if isinstance(diff_cfg, dict):
+            wrist_diff_config = diff_cfg
+    except Exception as e:
+        print(f"Warning: Failed to load {CONFIG_FILE}: {e}")
+
+
+def apply_robot_config_to_arm():
+    if not (ser and ser.is_open):
+        print("Config apply skipped: serial not connected.")
+        return False
+    if not robot_config:
+        print("Config apply skipped: robot_config is empty.")
+        return False
+
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        cfg = robot_config.get(str(mid), {})
+        try:
+            gr = float(cfg.get("gear_ratio", 1.0))
+            mn = float(cfg.get("min_angle", 0.0))
+            mx = float(cfg.get("max_angle", 360.0))
+            kp = float(cfg.get("kp", 5.0))
+            ki = float(cfg.get("ki", 1.0))
+            kd = float(cfg.get("kd", 0.0))
+            aol = float(cfg.get("aol", 500.0))
+            skp = float(cfg.get("skp", 0.3))
+            ski = float(cfg.get("ski", 0.0))
+            skd = float(cfg.get("skd", 0.0))
+            sol = float(cfg.get("sol", 20.0))
+        except Exception as e:
+            print(f"Config apply skipped for motor {mid}: {e}")
+            continue
+
+        batch = (
+            f"GEAR {mid} {gr:.6f}"
+            f"; JLIM {mid} {mn:.1f} {mx:.1f}"
+            f"; KP {mid} {kp:.4f}; KI {mid} {ki:.4f}; KD {mid} {kd:.4f}; AOL {mid} {aol:.2f}"
+            f"; SKP {mid} {skp:.4f}; SKI {mid} {ski:.4f}; SKD {mid} {skd:.4f}; SOL {mid} {sol:.2f}"
+        )
+        send_command(batch)
+        time.sleep(0.05)
+
+    encoder_slots = set()
+    for mid in robot_config:
+        enc_idx = robot_config.get(str(mid), {}).get("abs_encoder_index")
+        if enc_idx is None:
+            continue
+        try:
+            encoder_slots.add(int(enc_idx))
+        except Exception:
+            pass
+
+    for enc_idx in sorted(encoder_slots):
+        send_command(f"ENCMAP {enc_idx} 0")
+        time.sleep(0.01)
+
+    if wrist_diff_enabled():
+        diff_cfg = get_wrist_diff_config()
+        for enc_key, motor_key in (("pitch_encoder_index", "pitch_encoder_motor_id"),
+                                   ("roll_encoder_index", "roll_encoder_motor_id")):
+            enc_idx = diff_cfg.get(enc_key)
+            motor_id = diff_cfg.get(motor_key)
+            try:
+                if enc_idx is not None:
+                    send_command(f"ENCMAP {int(enc_idx)} 0")
+                    time.sleep(0.01)
+                    send_command(f"ENCMAP {int(enc_idx)} {int(motor_id)}")
+                    time.sleep(0.02)
+            except Exception:
+                pass
+
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        cfg = robot_config.get(str(mid), {})
+        enc_idx = cfg.get("abs_encoder_index")
+        if enc_idx is not None:
+            try:
+                send_command(f"ENCMAP {int(enc_idx)} {int(mid)}")
+                time.sleep(0.02)
+            except Exception:
+                pass
+        enable = 1 if bool(cfg.get("abs_pid_enabled", False)) else 0
+        if wrist_diff_enabled() and int(mid) in set(wrist_diff_joint_ids()):
+            enable = 0
+        send_command(f"ABSPID {mid} {enable}")
+        time.sleep(0.02)
+
+    print("Applied robot_config.json settings to arm controller.")
+    return True
+
+
+def save_robot_config():
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"motors": robot_config, "wrist_differential": wrist_diff_config}, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save {CONFIG_FILE}: {e}")
+
+
+def get_current_ik_rad_from_telemetry(mid):
+    cur_deg = get_current_ik_deg_from_apos(mid)
+    if cur_deg is None:
+        tele = latest_motor_pos_deg.get(int(mid))
+        if tele is None:
+            return None
+        cur_deg = tele - _get_ik_zero_offset(mid)
+    return math.radians(cur_deg)
+
+
+def get_current_real_joint_angles():
+    if my_chain is None:
+        return None
+    n = len(my_chain.links)
+    vals = [0.0] * n
+    have_any = False
+    for j in range(1, min(7, n)):
+        ang = get_current_ik_rad_from_telemetry(j)
+        if ang is None:
+            if actual_joint_angles is not None and j < len(actual_joint_angles):
+                vals[j] = actual_joint_angles[j]
+            elif j < len(current_joint_angles):
+                vals[j] = current_joint_angles[j]
+        else:
+            vals[j] = ang
+            have_any = True
+    if not have_any:
+        return None
+    vals = clamp_seed_angles_to_bounds(vals)
+    vals = enforce_locked_joints(vals)
+    return vals
+
+
+def update_wrist_diff_controller_once():
+    global wrist_diff_last_update_time, wrist_diff_last_motor_cmd
+    if not wrist_diff_enabled():
+        return False
+    if not (ser and ser.is_open):
+        return False
+    pitch_target = wrist_diff_target_logical_deg.get("pitch")
+    roll_target = wrist_diff_target_logical_deg.get("roll")
+    if pitch_target is None and roll_target is None:
+        return False
+    pitch_actual = get_wrist_output_logical_deg("pitch")
+    roll_actual = get_wrist_output_logical_deg("roll")
+    if pitch_actual is None or roll_actual is None:
+        return False
+
+    cfg = get_wrist_diff_config()
+    pid_cfg = cfg.get("pid", {})
+    now = time.time()
+    if wrist_diff_last_update_time > 0.0:
+        dt = clampf(now - wrist_diff_last_update_time, 0.01, 0.10)
+    else:
+        dt = 0.02
+    wrist_diff_last_update_time = now
+
+    axis_cmd = {}
+    all_in_deadband = True
+    for axis_name, actual_val, target_val in (
+        ("pitch", pitch_actual, pitch_target),
+        ("roll", roll_actual, roll_target),
+    ):
+        if target_val is None:
+            axis_cmd[axis_name] = 0.0
+            continue
+        err = float(target_val) - float(actual_val)
+        deadband = abs(float(pid_cfg.get("deadband_deg", 0.4)))
+        if abs(err) > deadband:
+            all_in_deadband = False
+        state = wrist_diff_pid_state[axis_name]
+        kp = float(pid_cfg.get(f"{axis_name}_kp", 4.0))
+        ki = float(pid_cfg.get(f"{axis_name}_ki", 0.0))
+        kd = float(pid_cfg.get(f"{axis_name}_kd", 0.0))
+        int_limit = abs(float(pid_cfg.get("integral_limit", 30.0)))
+        state["integral"] += err * dt
+        state["integral"] = clampf(state["integral"], -int_limit, int_limit)
+        deriv = (err - state["prev_error"]) / dt if dt > 1e-6 else 0.0
+        state["prev_error"] = err
+        cmd = (kp * err) + (ki * state["integral"]) + (kd * deriv)
+        max_axis_speed = abs(float(pid_cfg.get("max_axis_speed", 80.0)))
+        axis_cmd[axis_name] = clampf(cmd, -max_axis_speed, max_axis_speed)
+
+    mix = cfg.get("mix", {})
+    motor_a_id, motor_b_id = wrist_diff_motor_ids()
+    motor_a_cmd = (
+        axis_cmd.get("pitch", 0.0) * float(mix.get("motor_a_pitch_sign", 1.0))
+        + axis_cmd.get("roll", 0.0) * float(mix.get("motor_a_roll_sign", 1.0))
+    )
+    motor_b_cmd = (
+        axis_cmd.get("pitch", 0.0) * float(mix.get("motor_b_pitch_sign", 1.0))
+        + axis_cmd.get("roll", 0.0) * float(mix.get("motor_b_roll_sign", -1.0))
+    )
+    max_motor_speed = abs(float(pid_cfg.get("max_motor_speed", 120.0)))
+    motor_a_cmd = clampf(motor_a_cmd, -max_motor_speed, max_motor_speed)
+    motor_b_cmd = clampf(motor_b_cmd, -max_motor_speed, max_motor_speed)
+
+    if all_in_deadband:
+        motor_a_cmd = 0.0
+        motor_b_cmd = 0.0
+
+    prev_a, prev_b = wrist_diff_last_motor_cmd
+    if prev_a is None or prev_b is None or abs(prev_a - motor_a_cmd) >= 0.5 or abs(prev_b - motor_b_cmd) >= 0.5:
+        send_command(f"M {motor_a_id} {motor_a_cmd:.2f}; M {motor_b_id} {motor_b_cmd:.2f}")
+        wrist_diff_last_motor_cmd = (motor_a_cmd, motor_b_cmd)
+    return True
+
+
+def wrist_diff_control_loop():
+    while serial_running:
+        try:
+            update_wrist_diff_controller_once()
+            time.sleep(0.02)
+        except Exception:
+            time.sleep(0.05)
+
+
+def sync_solver_seed_from_telemetry(update_target=False):
+    global current_joint_angles, actual_joint_angles, current_target_xyz
+    tele_angles = get_current_real_joint_angles()
+    if tele_angles is None:
+        return False
+    synced_angles = clamp_seed_angles_to_bounds(enforce_locked_joints(tele_angles))
+    current_joint_angles = list(synced_angles)
+    actual_joint_angles = list(synced_angles)
+    refresh_locked_joint_rads(synced_angles)
+    if update_target and my_chain is not None:
+        sync_target_from_joint_angles(synced_angles)
+    return True
+
+
+def get_link_bounds_rad(link_index):
+    if my_chain is None or link_index < 0 or link_index >= len(my_chain.links):
+        return None
+    link = my_chain.links[link_index]
+    bounds = getattr(link, 'bounds', None)
+    if not isinstance(bounds, (tuple, list)) or len(bounds) != 2:
+        return None
+    lo, hi = bounds
+    try:
+        lo = float(lo)
+        hi = float(hi)
+    except Exception:
+        return None
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi < lo:
+        return None
+    return lo, hi
+
+
+def clamp_seed_angles_to_bounds(seed_angles):
+    if my_chain is None:
+        return seed_angles
+    n = len(my_chain.links)
+    if seed_angles is None:
+        seed = [0.0] * n
+    else:
+        seed = list(seed_angles)
+        if len(seed) < n:
+            seed.extend([0.0] * (n - len(seed)))
+        elif len(seed) > n:
+            seed = seed[:n]
+
+    for i in range(n):
+        bounds = get_link_bounds_rad(i)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        if seed[i] < lo:
+            seed[i] = lo
+        elif seed[i] > hi:
+            seed[i] = hi
+    return seed
+
+
+def motor_to_chain_index(mid):
+    if my_chain is None:
+        return None
+    idx = int(mid)
+    return idx if 0 <= idx < len(my_chain.links) else None
+
+
+def refresh_locked_joint_rads(source_angles=None):
+    global locked_joint_rads
+    if source_angles is None:
+        source_angles = actual_joint_angles if actual_joint_angles is not None else current_joint_angles
+    if source_angles is None:
+        return
+    for mid in LOCKED_MOTORS:
+        chain_idx = motor_to_chain_index(mid)
+        if chain_idx is None or chain_idx >= len(source_angles):
+            continue
+        try:
+            locked_joint_rads[mid] = float(source_angles[chain_idx])
+        except Exception:
+            pass
+
+
+def apply_chain_bounds_from_config():
+    if my_chain is None:
+        return
+    for mid in range(1, 7):
+        chain_idx = motor_to_chain_index(mid)
+        if chain_idx is None:
+            continue
+        link = my_chain.links[chain_idx]
+        if not hasattr(link, 'bounds'):
+            continue
+        cfg = robot_config.get(str(mid), {})
+        mn = float(cfg.get("min_angle", 0.0))
+        mx = float(cfg.get("max_angle", 360.0))
+        zoff = _get_ik_zero_offset(mid)
+        if PLANAR_MODE and mid in LOCKED_MOTORS:
+            locked = float(locked_joint_rads.get(mid, 0.0))
+            link.bounds = (locked - LOCKED_BOUNDS_EPS_RAD, locked + LOCKED_BOUNDS_EPS_RAD)
+            continue
+        lower = math.radians(mn - zoff)
+        upper = math.radians(mx - zoff)
+        if upper < lower:
+            lower, upper = upper, lower
+        link.bounds = (lower, upper)
+
+
+def enforce_locked_joints(joint_angles):
+    if joint_angles is None:
+        return joint_angles
+    angles = list(joint_angles)
+    if PLANAR_MODE:
+        for mid in LOCKED_MOTORS:
+            chain_idx = motor_to_chain_index(mid)
+            if chain_idx is None or chain_idx >= len(angles):
+                continue
+            angles[chain_idx] = float(locked_joint_rads.get(mid, angles[chain_idx]))
+    return angles
+
+
+def solve_ik_for_target(seed_angles=None):
+    if my_chain is None:
+        return None
+    if seed_angles is None:
+        seed_angles = current_joint_angles
+    seed = clamp_seed_angles_to_bounds(enforce_locked_joints(seed_angles))
+    apply_chain_bounds_from_config()
+    target_xyz = list(current_target_xyz)
+    if PLANAR_MODE:
+        target_xyz[1] = planar_target_y
+    solved = my_chain.inverse_kinematics(target_xyz, initial_position=seed)
+    solved = clamp_seed_angles_to_bounds(enforce_locked_joints(solved))
+    return solved
+
+
+def sync_target_from_joint_angles(joint_angles):
+    global current_target_xyz, planar_target_y
+    if my_chain is None or joint_angles is None:
+        return
+    try:
+        fk = my_chain.forward_kinematics(joint_angles)
+        current_target_xyz = list(fk[:3, 3])
+        if PLANAR_MODE:
+            planar_target_y = float(current_target_xyz[1])
+            current_target_xyz[1] = planar_target_y
+    except Exception:
+        pass
+
+
 # --- Serial Functions ---
 def find_serial_port():
     ports = serial.tools.list_ports.comports()
@@ -77,11 +758,15 @@ def find_serial_port():
     return ports[0].device
 
 def connect_serial():
-    global ser, robot_config
+    global ser, read_thread, tx_thread, wrist_diff_thread, last_command_wall_time
+    if ser and ser.is_open:
+        update_connection_button()
+        return True
     print("Looking for Arduino serial port...")
     port_name = find_serial_port()
     if not port_name:
         print("No serial ports found! Please plug in your device.")
+        update_connection_button()
         return False
 
     print(f"Connecting to {port_name}...")
@@ -89,105 +774,408 @@ def connect_serial():
         ser = serial.Serial(port_name, BAUD_RATE, timeout=0.1)
         time.sleep(2) # Wait for reset
         print("Connected successfully!")
-        
-        # Start a thread to read logs
+
+        latest_motor_pos_deg.clear()
+        latest_motor_apos_deg.clear()
+        latest_motor_telemetry_time.clear()
+
         read_thread = threading.Thread(target=read_from_port, daemon=True)
         read_thread.start()
-        
-        # Load and apply Robot Config
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r') as f:
-                    data = json.load(f)
-                    if "motors" in data:
-                        robot_config = data["motors"]
-            
-            print("Applying robot_config.json settings to Arm hardware...")
-            for i in range(1, 7):
-                mid = str(i)
-                if mid in robot_config:
-                    gr  = robot_config[mid].get("gear_ratio", 1.0)
-                    kp  = robot_config[mid].get("kp",  5.0)
-                    ki  = robot_config[mid].get("ki",  1.0)
-                    kd  = robot_config[mid].get("kd",  0.0)
-                    aol = robot_config[mid].get("aol", 500.0)
-                    skp = robot_config[mid].get("skp", 0.3)
-                    ski = robot_config[mid].get("ski", 0.0)
-                    skd = robot_config[mid].get("skd", 0.0)
-                    sol = robot_config[mid].get("sol", 20.0)
-                    mn  = robot_config[mid].get("min_angle",  0.0)
-                    mx  = robot_config[mid].get("max_angle",  360.0)
+        if tx_thread is None or not tx_thread.is_alive():
+            tx_thread = threading.Thread(target=command_tx_loop, daemon=True)
+            tx_thread.start()
+        if wrist_diff_thread is None or not wrist_diff_thread.is_alive():
+            wrist_diff_thread = threading.Thread(target=wrist_diff_control_loop, daemon=True)
+            wrist_diff_thread.start()
 
-                    batch = (
-                        f"GEAR {i} {gr}"
-                        f"; JLIM {i} {mn:.1f} {mx:.1f}"
-                        f"; KP {i} {kp:.4f}; KI {i} {ki:.4f}; KD {i} {kd:.4f}; AOL {i} {aol:.2f}"
-                        f"; SKP {i} {skp:.4f}; SKI {i} {ski:.4f}; SKD {i} {skd:.4f}; SOL {i} {sol:.2f}"
-                    )
-                    send_command(batch)
-                    time.sleep(0.05)
-            
-            # Enable telemetry for all motors so live position display works
-            send_command("T")
-        except Exception as e:
-            print(f"Warning: Failed to load and apply robot_config.json: {e}")
-            
+        send_command("S; TON")
+        load_robot_config()
+        print("Loaded robot_config.json for IK limits/offset mapping.")
+        apply_robot_config_to_arm()
+        time.sleep(0.25)
+        sync_solver_seed_from_telemetry(update_target=True)
+        move_configured_joints_to_zero_on_connect()
+        last_command_wall_time = time.time()
+        print("Serial connected and telemetry enabled.")
+        update_connection_button()
         return True
     except Exception as e:
         print(f"Failed to connect to {port_name}: {e}")
+        update_connection_button()
         return False
 
+def disconnect_serial():
+    global ser, read_thread
+    if ser and ser.is_open:
+        try:
+            clear_wrist_diff_targets(send_stop=True)
+            ser.close()
+        except Exception:
+            pass
+    ser = None
+    read_thread = None
+    latest_motor_pos_deg.clear()
+    latest_motor_apos_deg.clear()
+    latest_motor_telemetry_time.clear()
+    while not cmd_queue.empty():
+        try:
+            cmd_queue.get_nowait()
+            cmd_queue.task_done()
+        except Exception:
+            break
+    update_connection_button()
+    return True
+
+
+def update_connection_button():
+    global btn_connection
+    if btn_connection is None:
+        return
+    connected = bool(ser and ser.is_open)
+    tele_ok = has_fresh_telemetry()
+    if connected and tele_ok:
+        label = 'Connected'
+        color = 'lightgreen'
+    elif connected:
+        label = 'Port Open'
+        color = 'khaki'
+    else:
+        label = 'Disconnected'
+        color = 'lightcoral'
+    btn_connection.label.set_text(label)
+    try:
+        btn_connection.ax.set_facecolor(color)
+    except Exception:
+        pass
+
+
+def has_fresh_telemetry():
+    now = time.time()
+    for ts in latest_motor_telemetry_time.values():
+        try:
+            if (now - float(ts)) <= TELEMETRY_STALE_SEC:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def get_connection_status_text():
+    connected = bool(ser and ser.is_open)
+    tele_ok = has_fresh_telemetry()
+    now = time.time()
+    if last_serial_command_time > 0:
+        cmd_age = now - last_serial_command_time
+        cmd_age_str = f"{cmd_age:4.2f}s ago"
+    else:
+        cmd_age_str = "never"
+    if latest_motor_telemetry_time:
+        newest = max(latest_motor_telemetry_time.values())
+        tele_age_str = f"{(now - newest):4.2f}s ago"
+    else:
+        tele_age_str = "never"
+    last_cmd = last_serial_command if last_serial_command else "<none>"
+    if len(last_cmd) > 58:
+        last_cmd = last_cmd[:55] + "..."
+    return (
+        "Link Status\n"
+        f"Port:      {'OPEN' if connected else 'CLOSED'}\n"
+        f"Telemetry: {'LIVE' if tele_ok else 'STALE'} ({tele_age_str})\n"
+        f"Sent Cmds: {serial_command_count}\n"
+        f"Last Send: {cmd_age_str}\n"
+        f"Last Cmd:  {last_cmd}"
+    )
+
+
+def wait_for_telemetry(timeout_sec=AUTO_MOVE_TO_ZERO_WAIT_SEC):
+    deadline = time.time() + max(0.0, float(timeout_sec))
+    while time.time() < deadline:
+        if has_fresh_telemetry():
+            return True
+        time.sleep(0.05)
+    return has_fresh_telemetry()
+
+
+def get_auto_zero_motor_ids():
+    motor_ids = []
+    pitch_joint_id, roll_joint_id = wrist_diff_joint_ids()
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        cfg = robot_config.get(str(mid), {})
+        if wrist_diff_enabled() and int(mid) in {pitch_joint_id, roll_joint_id}:
+            continue
+        if cfg.get("abs_encoder_index") is None:
+            continue
+        if not bool(cfg.get("abs_pid_enabled", False)):
+            continue
+        motor_ids.append(int(mid))
+    return motor_ids
+
+
+def move_configured_joints_to_zero_on_connect():
+    if not AUTO_MOVE_TO_ZERO_ON_CONNECT:
+        return False
+    if not (ser and ser.is_open):
+        return False
+    motor_ids = get_auto_zero_motor_ids()
+    wrist_active = wrist_diff_enabled()
+    if not motor_ids and not wrist_active:
+        print("Auto-zero move skipped: no configured abs-encoder joints.")
+        return False
+    if not wait_for_telemetry():
+        print("Auto-zero move skipped: telemetry not ready.")
+        return False
+
+    did_queue = False
+
+    if wrist_active:
+        pitch_joint_id, roll_joint_id = wrist_diff_joint_ids()
+        pitch_min, pitch_max = get_motor_limits(pitch_joint_id)
+        roll_min, roll_max = get_motor_limits(roll_joint_id)
+        pitch_target = normalize_target_for_limits(0.0, pitch_min, pitch_max, reference_deg=0.0)
+        roll_target = normalize_target_for_limits(0.0, roll_min, roll_max, reference_deg=0.0)
+        if not is_full_range(pitch_min, pitch_max):
+            pitch_target = clampf(pitch_target, pitch_min, pitch_max)
+        if not is_full_range(roll_min, roll_max):
+            roll_target = clampf(roll_target, roll_min, roll_max)
+        set_wrist_diff_targets(pitch_target, roll_target)
+        last_sent_logical_deg[pitch_joint_id] = pitch_target
+        last_sent_logical_deg[roll_joint_id] = roll_target
+        did_queue = True
+
+    cmds = []
+    for mid in motor_ids:
+        min_a, max_a = get_motor_limits(mid)
+        target_deg = normalize_target_for_limits(0.0, min_a, max_a, reference_deg=0.0)
+        if not is_full_range(min_a, max_a):
+            target_deg = clampf(target_deg, min_a, max_a)
+        cmds.append(f"P {mid} {target_deg:.2f}")
+        last_sent_logical_deg[mid] = target_deg
+
+    if not cmds:
+        if did_queue:
+            print("Auto-zero move queued for differential wrist outputs.")
+            return True
+        print("Auto-zero move skipped: no valid zero commands generated.")
+        return False
+
+    packet = ";".join(cmds)
+    for send_idx in range(3):
+        send_command(packet)
+        if send_idx < 2:
+            time.sleep(0.04)
+    if did_queue:
+        print("Auto-zero move queued for differential wrist outputs and joints:", ", ".join(f"J{mid}" for mid in motor_ids))
+    else:
+        print("Auto-zero move queued for joints:", ", ".join(f"J{mid}" for mid in motor_ids))
+    return True
+
+def toggle_connection_callback(event):
+    if ser and ser.is_open:
+        disconnect_serial()
+        print("Disconnected from serial device.")
+    else:
+        if connect_serial():
+            print("Serial connection established.")
+        else:
+            print("Serial connection failed.")
+    render_plot()
+
 def read_from_port():
-    global actual_joint_angles
+    global latest_motor_pos_deg, latest_motor_apos_deg, latest_motor_telemetry_time, last_telemetry_line, actual_joint_angles
     import re
+    motor_re = re.compile(r"M(\d+)")
+    pos_re = re.compile(r"POS:([^\s|]+)")
+    apos_re = re.compile(r"APOS:([^\s|]+)")
     while ser and ser.is_open:
         try:
             if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line:
+                    last_telemetry_line = line
                     print(f"[Arduino] {line}")
-                    # Parse telemetry to update actual_joint_angles for visualization
+                    # Parse telemetry from multi-motor lines:
+                    # M1 POS:.. | M2 POS:.. |
                     for token in line.split("|"):
                         token = token.strip()
-                        if token.startswith("M"):
-                            match = re.search(r"M(\d+)\s+POS:([-\d.]+)", token)
-                            if match:
-                                mid = int(match.group(1))
-                                pos = float(match.group(2))
-                                # Prefer APOS (absolute encoder) if present
-                                apos_match = re.search(r"APOS:([-\d.]+)", token)
-                                if apos_match:
-                                    pos = float(apos_match.group(1))
-                                if actual_joint_angles is not None and mid < len(actual_joint_angles):
-                                    actual_joint_angles[mid] = np.radians(pos)
+                        if not token.startswith("M"):
+                            continue
+                        mm = motor_re.search(token)
+                        pm = pos_re.search(token)
+                        am = apos_re.search(token)
+                        if not mm:
+                            continue
+                        try:
+                            mid = int(mm.group(1))
+                            now = time.time()
+                            if pm:
+                                pv = _safe_float(pm.group(1))
+                                if pv is not None:
+                                    latest_motor_pos_deg[mid] = pv
+                            if am:
+                                av = _safe_float(am.group(1))
+                                if av is not None:
+                                    latest_motor_apos_deg[mid] = av
+                            latest_motor_telemetry_time[mid] = now
+                        except Exception:
+                            pass
             time.sleep(0.01)
+        except (serial.SerialException, OSError) as e:
+            print(f"Serial read error: {e}")
+            break
         except Exception:
             break
 
-def send_command(cmd):
-    if ser and ser.is_open:
+def _is_motion_command(cmd):
+    motion_ops = {"S", "P", "PR", "M", "MV", "CAL", "JLIM"}
+    for part in [p.strip() for p in cmd.split(";") if p.strip()]:
+        toks = part.split()
+        op = toks[0].upper() if toks else ""
+        if op in motion_ops:
+            return True
+    return False
+
+
+def _clear_pending_commands():
+    while not cmd_queue.empty():
         try:
-            ser.write((cmd + '\n').encode('utf-8'))
+            cmd_queue.get_nowait()
+            cmd_queue.task_done()
+        except Exception:
+            break
+
+
+def command_tx_loop():
+    while serial_running:
+        try:
+            cmd = cmd_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        try:
+            if ser and ser.is_open:
+                ser.write((cmd + '\n').encode('utf-8'))
+                time.sleep(0.015)
         except Exception as e:
             print(f"Error sending command: {e}")
+        finally:
+            cmd_queue.task_done()
 
-def send_joints_to_arm(joint_angles_rad):
-    """Send IK joint angles to motors, applying zero_offset and clamping to limits."""
-    cmds = []
+
+def send_command(cmd):
+    global last_serial_command, last_serial_command_time, serial_command_count
+    if ser and ser.is_open:
+        try:
+            if _is_motion_command(cmd):
+                _clear_pending_commands()
+            cmd_queue.put(cmd)
+            last_serial_command = cmd
+            last_serial_command_time = time.time()
+            serial_command_count += 1
+            print(f"[TX QUEUED] {cmd}")
+        except Exception as e:
+            print(f"Error sending command: {e}")
+    else:
+        print(f"[TX BLOCKED] Serial not connected: {cmd}")
+
+def send_joints_to_arm(joint_angles_rad, smooth=False, max_ramp_steps=20, force_immediate=False, repeat_count=1):
+    """Send IK joint angles with limit-aware clamping and optional ramping."""
+    global last_command_wall_time
+
+    joint_angles_rad = clamp_seed_angles_to_bounds(enforce_locked_joints(joint_angles_rad))
+
+    target_logical = {}
+    use_wrist_diff = wrist_diff_enabled()
+    pitch_joint_id, roll_joint_id = wrist_diff_joint_ids()
+
     for i in range(1, min(7, len(joint_angles_rad))):
+        if PLANAR_MODE and i in LOCKED_MOTORS:
+            continue
         mid = str(i)
-        zero_off = robot_config.get(mid, {}).get("zero_offset", 0.0)
-        min_a    = robot_config.get(mid, {}).get("min_angle",  0.0)
-        max_a    = robot_config.get(mid, {}).get("max_angle",  360.0)
+        zero_off = _get_ik_zero_offset(mid)
 
         deg = np.degrees(joint_angles_rad[i])
-        # Apply zero offset: motor_angle = IK_angle + zero_offset
-        deg = (deg + zero_off) % 360.0
-        # Clamp to physical limits
-        deg = max(min_a, min(max_a, deg))
-        cmds.append(f"P {i} {deg:.2f}")
-    if cmds:
-        send_command(";".join(cmds))
+
+        logical_target = deg + zero_off
+        min_a, max_a = get_motor_limits(i)
+        current_ref = get_start_command_position(i, logical_target)
+        logical_target = normalize_target_for_limits(
+            logical_target, min_a, max_a, reference_deg=current_ref
+        )
+        if not is_full_range(min_a, max_a):
+            logical_target = clampf(logical_target, min_a, max_a)
+        target_logical[i] = logical_target
+
+    if use_wrist_diff:
+        pitch_target = target_logical.get(pitch_joint_id)
+        roll_target = target_logical.get(roll_joint_id)
+        if pitch_target is not None or roll_target is not None:
+            set_wrist_diff_targets(pitch_target, roll_target)
+
+    if not target_logical:
+        print("[TX SKIPPED] No active motor targets were generated.")
+        return
+
+    if force_immediate:
+        cmds = []
+        for mid, target in target_logical.items():
+            if use_wrist_diff and mid in {pitch_joint_id, roll_joint_id}:
+                last_sent_logical_deg[mid] = target
+                continue
+            cmds.append(f"P {mid} {target:.2f}")
+            last_sent_logical_deg[mid] = target
+        if cmds:
+            packet = ";".join(cmds)
+            repeat_total = max(1, int(repeat_count))
+            for send_idx in range(repeat_total):
+                send_command(packet)
+                if send_idx + 1 < repeat_total:
+                    time.sleep(0.04)
+            last_command_wall_time = time.time()
+        else:
+            print("[TX SKIPPED] Immediate send produced no commands.")
+        return
+
+    now = time.time()
+    dt = now - last_command_wall_time if last_command_wall_time > 0 else 0.05
+    dt = clampf(dt, 0.02, 0.20)
+    max_step = min(MAX_COMMAND_STEP_DEG, MAX_COMMAND_RATE_DEG_PER_SEC * dt)
+    if max_step < 0.5:
+        max_step = 0.5
+
+    planned_current = {
+        mid: get_start_command_position(mid, target)
+        for mid, target in target_logical.items()
+    }
+
+    steps = max_ramp_steps if smooth else 1
+    for _ in range(steps):
+        cmds = []
+        reached_all = True
+
+        for mid, target in target_logical.items():
+            current = planned_current[mid]
+            next_cmd, reached = command_step_toward(mid, current, target, max_step)
+            reached_all = reached_all and reached
+            planned_current[mid] = next_cmd
+
+            prev = last_sent_logical_deg.get(mid)
+            if use_wrist_diff and mid in {pitch_joint_id, roll_joint_id}:
+                last_sent_logical_deg[mid] = next_cmd
+                continue
+            if prev is None or command_distance_deg(mid, prev, next_cmd) >= COMMAND_DEADBAND_DEG:
+                cmds.append(f"P {mid} {next_cmd:.2f}")
+                last_sent_logical_deg[mid] = next_cmd
+            else:
+                last_sent_logical_deg[mid] = next_cmd
+
+        if cmds:
+            send_command(";".join(cmds))
+            last_command_wall_time = time.time()
+        else:
+            print("[TX SKIPPED] Ramp/deadband suppressed this step.")
+
+        if reached_all:
+            break
+        time.sleep(RAMP_INTERVAL_SEC)
 
 # --- UI and Visualization ---
 # Key states
@@ -246,6 +1234,8 @@ def extract_xyz(positions):
     x = [p[0,3] for p in positions]
     y = [p[1,3] for p in positions]
     z = [p[2,3] for p in positions]
+    if DISPLAY_MIRROR_X:
+        x = [-v for v in x]
     return x, y, z
 
 def init_plot_elements():
@@ -254,7 +1244,7 @@ def init_plot_elements():
     global arm_line_side, ghost_line_side, target_point_side
     global ax, ax_top, ax_side
 
-    for a in [ax, ax_top, ax_side]:
+    for a in [ax, ax_side]:
         if a is not None:
             a.cla()
             a.set_xlim(-0.6, 0.6)
@@ -265,16 +1255,14 @@ def init_plot_elements():
             a.set_zlabel('Z')
 
     ax.set_title("Main 3D View")
-    ax_top.set_title("Top View (XY)")
     ax_side.set_title("Side View (XZ)")
 
     ghost_line, = ax.plot([], [], [], '-o', color='darkorange', alpha=0.4, linewidth=4, markersize=8)
     arm_line, = ax.plot([], [], [], '-o', color='tab:blue', linewidth=5, markersize=10)
     target_point, = ax.plot([], [], [], 'x', color='red', markersize=12, markeredgewidth=2)
-    
-    ghost_line_top, = ax_top.plot([], [], [], '-o', color='darkorange', alpha=0.4, linewidth=4, markersize=8)
-    arm_line_top, = ax_top.plot([], [], [], '-o', color='tab:blue', linewidth=5, markersize=10)
-    target_point_top, = ax_top.plot([], [], [], 'x', color='red', markersize=12, markeredgewidth=2)
+    ghost_line_top = None
+    arm_line_top = None
+    target_point_top = None
     
     ghost_line_side, = ax_side.plot([], [], [], '-o', color='darkorange', alpha=0.4, linewidth=4, markersize=8)
     arm_line_side, = ax_side.plot([], [], [], '-o', color='tab:blue', linewidth=5, markersize=10)
@@ -287,6 +1275,7 @@ def render_plot():
     global arm_line_top, ghost_line_top, target_point_top
     global arm_line_side, ghost_line_side, target_point_side
     global ax, ax_top, ax_side
+    global txt_angles, txt_joint_dashboard, txt_connection_status
 
     if my_chain is None:
         return
@@ -295,13 +1284,18 @@ def render_plot():
         # By default, start with the current virtual position
         actual_joint_angles = list(current_joint_angles)
 
+    if sync_model_to_telemetry and not is_previewing:
+        tele_angles = get_current_real_joint_angles()
+        if tele_angles is not None:
+            actual_joint_angles = tele_angles
+
     if ghost_line is None:
         init_plot_elements()
 
     # compute ghost and arm poses
     ghost_pos = my_chain.forward_kinematics(actual_joint_angles, full_kinematics=True)
     gx, gy, gz = extract_xyz(ghost_pos)
-    for gl in [ghost_line, ghost_line_top, ghost_line_side]:
+    for gl in [ghost_line, ghost_line_side]:
         gl.set_data(gx, gy)
         gl.set_3d_properties(gz)
 
@@ -315,7 +1309,7 @@ def render_plot():
     
     arm_pos = my_chain.forward_kinematics(angles_to_draw, full_kinematics=True)
     x, y, z = extract_xyz(arm_pos)
-    for al in [arm_line, arm_line_top, arm_line_side]:
+    for al in [arm_line, arm_line_side]:
         al.set_data(x, y)
         al.set_3d_properties(z)
 
@@ -326,18 +1320,70 @@ def render_plot():
         joint_texts[i-1].set_visible(True)
 
     # marker
-    for tp in [target_point, target_point_top, target_point_side]:
-        tp.set_data([current_target_xyz[0]], [current_target_xyz[1]])
+    for tp in [target_point, target_point_side]:
+        target_x = -current_target_xyz[0] if DISPLAY_MIRROR_X else current_target_xyz[0]
+        tp.set_data([target_x], [current_target_xyz[1]])
         tp.set_3d_properties([current_target_xyz[2]])
 
     ax.view_init(elev=cam_elev, azim=cam_azim)
-    ax_top.view_init(elev=90, azim=-90)
     ax_side.view_init(elev=0, azim=-90)
 
-    if txt_angles:
-        active_joints = current_joint_angles[1:] if len(current_joint_angles) > 1 else []
-        angle_strs = [f"J{i+1}: {np.degrees(a)%360:.1f}°" for i, a in enumerate(active_joints[:6])]
-        txt_angles.set_text("Target Joints:\n" + "\n".join(angle_strs))
+    if fig is not None:
+        if txt_joint_dashboard is None:
+            txt_joint_dashboard = fig.text(
+                0.66,
+                0.94,
+                "",
+                fontsize=9,
+                va='top',
+                ha='left',
+                bbox=dict(facecolor='whitesmoke', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'),
+            )
+        if txt_connection_status is None:
+            txt_connection_status = fig.text(
+                0.66,
+                0.82,
+                "",
+                fontsize=9,
+                va='top',
+                ha='left',
+                family='monospace',
+                bbox=dict(facecolor='aliceblue', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'),
+            )
+
+        rows = []
+        worst_err = 0.0
+        have_any_apos = False
+        for j in range(1, 7):
+            if j >= len(current_joint_angles):
+                continue
+            tgt_deg = float(np.degrees(current_joint_angles[j]))
+            cur_deg = get_current_ik_deg_from_apos(j)
+            if cur_deg is None:
+                rows.append(f"J{j}:  tgt {tgt_deg:7.1f}°   cur   ---.-°   err  ---.-°")
+                continue
+
+            have_any_apos = True
+            err = abs(cur_deg - tgt_deg)
+            worst_err = max(worst_err, err)
+            rows.append(f"J{j}:  tgt {tgt_deg:7.1f}°   cur {cur_deg:7.1f}°   err {err:6.1f}°")
+
+        txt_joint_dashboard.set_text("Joint Dashboard (APOS)\n" + "\n".join(rows))
+        try:
+            txt_joint_dashboard.get_bbox_patch().set_facecolor('#f4f4f4' if have_any_apos else '#dddddd')
+        except Exception:
+            pass
+        txt_connection_status.set_text(get_connection_status_text())
+        try:
+            if bool(ser and ser.is_open) and has_fresh_telemetry():
+                txt_connection_status.get_bbox_patch().set_facecolor('#d8f5d0')
+            elif bool(ser and ser.is_open):
+                txt_connection_status.get_bbox_patch().set_facecolor('#fff2b3')
+            else:
+                txt_connection_status.get_bbox_patch().set_facecolor('#f4cccc')
+        except Exception:
+            pass
+        update_connection_button()
         
     fig.canvas.draw_idle()
 
@@ -382,9 +1428,10 @@ def keyboard_update_loop():
         else:
             # Adjust XYZ
             new_x = max(slider_x.valmin, min(slider_x.valmax, current_target_xyz[0] + d1*step))
-            new_y = max(slider_y.valmin, min(slider_y.valmax, current_target_xyz[1] + d2*step))
+            target_y = planar_target_y if PLANAR_MODE else current_target_xyz[1]
+            new_y = max(slider_y.valmin, min(slider_y.valmax, target_y + d2*step))
             new_z = max(slider_z.valmin, min(slider_z.valmax, current_target_xyz[2] + d3*step))
-            current_target_xyz = [new_x, new_y, new_z]
+            current_target_xyz = [new_x, planar_target_y if PLANAR_MODE else new_y, new_z]
         
         update_plot(val=None)
     elif is_previewing or moved_cam:
@@ -397,14 +1444,13 @@ def update_joint(val, idx):
     
     if idx < len(current_joint_angles):
         current_joint_angles[idx] = np.radians(val)
+    current_joint_angles = enforce_locked_joints(current_joint_angles)
+    refresh_locked_joint_rads(current_joint_angles)
     
-    # Re-run IK using the manually adjusted joint angle as the new 'seed'
-    # This forces the IK solver to find a solution keeping the SAME XYZ/RPY target, 
-    # but conforming around your chosen joint angle if possible.
-    target_orientation = [-1, 0, 0] # Simple placeholder target constraint to try and align wrist
-    new_angles = my_chain.inverse_kinematics(current_target_xyz, initial_position=current_joint_angles)
+    new_angles = solve_ik_for_target(current_joint_angles)
+    if new_angles is None:
+        return
     
-    # Snap to the closest valid mathematical pose
     current_joint_angles = list(new_angles)
     
     # Update Joint sliders silently to reflect the solver's snapped state
@@ -418,7 +1464,7 @@ def update_joint(val, idx):
     render_plot()
 
 def update_plot(val=None):
-    global current_target_xyz, current_target_rpy, current_joint_angles, last_send_time
+    global current_target_xyz, current_target_rpy, current_joint_angles, last_send_time, planar_target_y
     global is_previewing
     
     if is_previewing:
@@ -434,7 +1480,9 @@ def update_plot(val=None):
         p = slider_p.val
         yw = slider_y_rot.val
         
-        current_target_xyz = [x, y, z]
+        if PLANAR_MODE:
+            planar_target_y = float(y)
+        current_target_xyz = [x, planar_target_y if PLANAR_MODE else y, z]
         current_target_rpy = [r, p, yw]
     else:
         # Came from keyboard, update slider silently
@@ -459,20 +1507,10 @@ def update_plot(val=None):
         slider_p.eventson = True
         slider_y_rot.eventson = True
 
-    # Convert RPY directly into ikpy target constraints using a simple translation trick. 
-    # We configure a 'target_orientation' direction vector 
-    dir_vector = [
-        np.cos(np.radians(current_target_rpy[2])) * np.cos(np.radians(current_target_rpy[1])),
-        np.sin(np.radians(current_target_rpy[2])) * np.cos(np.radians(current_target_rpy[1])),
-        np.sin(np.radians(current_target_rpy[1]))
-    ]
-    
-    # Compute IK
-    # Orientation is partially supported by providing a target Z direction. 
-    current_joint_angles = my_chain.inverse_kinematics(current_target_xyz, 
-                                                     target_orientation=dir_vector,
-                                                     orientation_mode="Z",
-                                                     initial_position=current_joint_angles)
+    solved_angles = solve_ik_for_target(current_joint_angles)
+    if solved_angles is not None:
+        current_joint_angles = list(solved_angles)
+        refresh_locked_joint_rads(current_joint_angles)
     
     # Update Joint sliders silently
     if 'joint_sliders' in globals():
@@ -496,8 +1534,11 @@ def find_alternative_ik(event):
         seed = [0.0] * len(current_joint_angles)
         for i in range(1, len(seed)):
             seed[i] = np.random.uniform(-np.pi, np.pi)
+        seed = clamp_seed_angles_to_bounds(enforce_locked_joints(seed))
         
-        test_angles = my_chain.inverse_kinematics(current_target_xyz, initial_position=seed)
+        test_angles = solve_ik_for_target(seed)
+        if test_angles is None:
+            continue
         fk = my_chain.forward_kinematics(test_angles)
         
         # Check if the generated solution actually hits the target
@@ -507,6 +1548,7 @@ def find_alternative_ik(event):
             diff = np.linalg.norm(np.array(test_angles[1:]) - np.array(current_joint_angles[1:]))
             if diff > 0.5:
                 current_joint_angles = list(test_angles)
+                refresh_locked_joint_rads(current_joint_angles)
                 print(f"Found alternative solution! (Diff: {diff:.2f} rad, Error: {dist:.4f}m)")
                 
                 # Update Joint sliders silently
@@ -530,11 +1572,21 @@ def preview_button_callback(event):
     render_plot()
 
 def execute_button_callback(event):
-    global actual_joint_angles, last_send_time
+    global actual_joint_angles, last_send_time, current_joint_angles
     if event is not None:
         print("Executing: Sending joint angles to Arm!")
+    current_joint_angles = clamp_seed_angles_to_bounds(enforce_locked_joints(current_joint_angles))
     actual_joint_angles = list(current_joint_angles)
-    send_joints_to_arm(current_joint_angles)
+    refresh_locked_joint_rads(actual_joint_angles)
+    # Manual execute always sends an explicit final position packet.
+    # Live updates continue to use a single-step rate-limited send path.
+    send_joints_to_arm(
+        current_joint_angles,
+        smooth=False,
+        max_ramp_steps=1,
+        force_immediate=True,
+        repeat_count=3,
+    )
     last_send_time = time.time()
     render_plot()
 
@@ -546,16 +1598,60 @@ def toggle_live_update(label):
     else:
         print("Live update DISABLED.")
 
+def toggle_sync_model_to_telemetry(label):
+    global sync_model_to_telemetry
+    sync_model_to_telemetry = not sync_model_to_telemetry
+    if sync_model_to_telemetry:
+        tele_angles = get_current_real_joint_angles()
+        if tele_angles is not None:
+            global actual_joint_angles
+            actual_joint_angles = tele_angles
+            refresh_locked_joint_rads(actual_joint_angles)
+        print("Ghost sync to telemetry ENABLED.")
+    else:
+        print("Ghost sync to telemetry DISABLED.")
+    render_plot()
+
+def set_current_pose_as_motor_and_ik_zero(event):
+    updated = []
+    cal_cmds = []
+    for mid in (1, 2, 3, 4, 5, 6):
+        logical_now = latest_motor_pos_deg.get(mid)
+        if logical_now is None:
+            continue
+        cfg = robot_config.setdefault(str(mid), {})
+        apos_now = latest_motor_apos_deg.get(mid)
+        if apos_now is not None:
+            cfg["abs_zero_offset"] = float(apos_now)
+        cfg["zero_offset"] = 0.0
+        cal_cmds.append(f"CAL {mid} 0")
+        updated.append(mid)
+
+    if not updated:
+        print("Set zero skipped: no telemetry available.")
+        return
+
+    if cal_cmds:
+        send_command("; ".join(cal_cmds))
+        time.sleep(0.10)
+    save_robot_config()
+    sync_solver_seed_from_telemetry(update_target=True)
+    print("Set current pose as motor+IK zero for joints:", ", ".join(f"J{m}" for m in updated))
+    render_plot()
+
 def emergency_stop_callback(event):
     print("EMERGENCY STOP TRIGGERED!")
+    for mid in last_sent_logical_deg:
+        last_sent_logical_deg[mid] = None
     send_command("S")
 
 def main():
     global my_chain, fig, ax, ax_top, ax_side
     global slider_x, slider_y, slider_z, slider_step, txt_angles
     global slider_r, slider_p, slider_y_rot
-    global joint_sliders, slider_prev
+    global joint_sliders, slider_prev, btn_connection, planar_target_y
     
+    load_robot_config()
     print("Loading URDF file:", URDF_FILE)
     try:
         # ikpy doesn't support 'continuous' joints, so we patch it in memory
@@ -569,33 +1665,11 @@ def main():
 
         my_chain = Chain.from_urdf_file(temp_path)
         
-        # Patch joint limits into ikpy from robot_config.json
-        # Links 1..N correspond to joints 1..N (link 0 is the base).
-        # Bounds are in radians, relative to the URDF/IK zero which is offset
-        # from the physical motor zero by zero_offset degrees.
-        active_joint_idx = 0
-        for link_idx, link in enumerate(my_chain.links):
-            if link_idx == 0:
-                continue  # skip base
-            active_joint_idx += 1
-            mid = str(active_joint_idx)
-            if mid in robot_config:
-                mn   = robot_config[mid].get("min_angle",  0.0)
-                mx   = robot_config[mid].get("max_angle",  360.0)
-                zoff = robot_config[mid].get("zero_offset", 0.0)
-                # Convert physical degree limits to IK-frame radians
-                lower = math.radians(mn - zoff)
-                upper = math.radians(mx - zoff)
-                if hasattr(link, 'bounds'):
-                    link.bounds = (lower, upper)
-            if active_joint_idx >= 6:
-                break
-
-        # Determine number of joints in the chain, ignoring the Base link (which is usually index 0)
-        # We need this to safely map the real arm joints dynamically:
         global current_joint_angles
         num_joints = len(my_chain.links)
-        current_joint_angles = [0.0] * num_joints
+        current_joint_angles = clamp_seed_angles_to_bounds([0.0] * num_joints)
+        refresh_locked_joint_rads(current_joint_angles)
+        apply_chain_bounds_from_config()
         
         os.remove(temp_path)
         
@@ -606,51 +1680,47 @@ def main():
         sys.exit(1)
 
     connect_serial()
+    if not sync_solver_seed_from_telemetry(update_target=True):
+        refresh_locked_joint_rads(current_joint_angles)
+        apply_chain_bounds_from_config()
+        sync_target_from_joint_angles(current_joint_angles)
+    planar_target_y = float(current_target_xyz[1])
 
-    # --- Setup Matplotlib Figure ---
-    fig = plt.figure(figsize=(14, 8))
+    fig = plt.figure(figsize=(15, 8.5))
     fig.canvas.manager.set_window_title("6DoF Robot Arm IK Visualization")
     
-    # 3D Axes for visualization
-    ax = fig.add_subplot(1, 2, 1, projection='3d')
-    ax_top = fig.add_subplot(2, 2, 2, projection='3d')
-    ax_side = fig.add_subplot(2, 2, 4, projection='3d')
-    plt.subplots_adjust(left=0.01, bottom=0.05, right=0.6, top=0.95, wspace=0.1, hspace=0.1) 
-    
-    # Slider configurations
-    slider_width = 0.22
-    slider_left = 0.72
-    dh = 0.033 # vertical step
-    current_y = 0.90
-    
-    # Target Joints text box
-    txt_angles = fig.text(0.65, 0.90, "", fontsize=10, va='top', ha='left', 
-                          bbox=dict(facecolor='aliceblue', alpha=0.8, edgecolor='black', boxstyle='round,pad=0.5'))
+    ax = fig.add_axes([0.03, 0.18, 0.36, 0.52], projection='3d')
+    ax_top = None
+    ax_side = fig.add_axes([0.41, 0.22, 0.18, 0.26], projection='3d')
+
+    slider_width = 0.28
+    slider_left = 0.66
+    dh = 0.033
+    current_y = 0.58
 
     axcolor = 'lightgoldenrodyellow'
-    current_y = 0.86
-    ax_x = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor=axcolor); current_y -= dh
-    ax_y = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor=axcolor); current_y -= dh
-    ax_z = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor=axcolor); current_y -= dh
+    ax_x = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor=axcolor); current_y -= dh
+    ax_y = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor=axcolor); current_y -= dh
+    ax_z = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor=axcolor); current_y -= dh
     
     current_y -= 0.01
-    ax_r = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightgreen'); current_y -= dh
-    ax_p = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightgreen'); current_y -= dh
-    ax_yw= plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightgreen'); current_y -= dh
+    ax_r = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightgreen'); current_y -= dh
+    ax_p = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightgreen'); current_y -= dh
+    ax_yw= plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightgreen'); current_y -= dh
     
     current_y -= 0.01
-    ax_step = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor=axcolor); current_y -= dh
+    ax_step = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor=axcolor); current_y -= dh
     
-    current_y -= 0.02
-    ax_j1 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
-    ax_j2 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
-    ax_j3 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
-    ax_j4 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
-    ax_j5 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
-    ax_j6 = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor='lightblue'); current_y -= dh
+    current_y -= 0.015
+    ax_j1 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
+    ax_j2 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
+    ax_j3 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
+    ax_j4 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
+    ax_j5 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
+    ax_j6 = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor='lightblue'); current_y -= dh
     
     current_y -= 0.01
-    ax_prev_t = plt.axes([slider_left, current_y, slider_width, 0.02], facecolor=axcolor); current_y -= dh
+    ax_prev_t = plt.axes([slider_left, current_y, slider_width, 0.022], facecolor=axcolor); current_y -= dh
 
     # Sliders mapping
     slider_x = Slider(ax_x, 'X Target', -1.0, 1.0, valinit=current_target_xyz[0])
@@ -690,30 +1760,39 @@ def main():
         PREVIEW_DURATION = val
     slider_prev.on_changed(update_prev_time)
 
-    # Buttons Row
-    current_y -= 0.05
-    ax_alt = plt.axes([0.65, current_y, 0.13, 0.04])
-    btn_alt = Button(ax_alt, 'Alternative IK', color='thistle', hovercolor='0.9')
-    btn_alt.on_clicked(find_alternative_ik)
+    ax_conn = plt.axes([0.66, 0.31, 0.14, 0.045])
+    btn_connection = Button(ax_conn, 'Disconnected', color='lightcoral', hovercolor='0.9')
+    btn_connection.on_clicked(toggle_connection_callback)
 
-    ax_prev_btn = plt.axes([0.80, current_y, 0.13, 0.04])
-    btn_prev = Button(ax_prev_btn, 'Preview (Plan)', color='lightblue', hovercolor='0.9')
-    btn_prev.on_clicked(preview_button_callback)
-
-    current_y -= 0.06
-    ax_exec = plt.axes([0.65, current_y, 0.13, 0.04])
+    ax_exec = plt.axes([0.82, 0.31, 0.12, 0.045])
     btn_exec = Button(ax_exec, 'Execute', color='lightgreen', hovercolor='0.9')
     btn_exec.on_clicked(execute_button_callback)
 
-    ax_live = plt.axes([0.80, current_y, 0.13, 0.04])
+    ax_alt = plt.axes([0.66, 0.25, 0.14, 0.045])
+    btn_alt = Button(ax_alt, 'Alternative IK', color='thistle', hovercolor='0.9')
+    btn_alt.on_clicked(find_alternative_ik)
+
+    ax_prev_btn = plt.axes([0.82, 0.25, 0.12, 0.045])
+    btn_prev = Button(ax_prev_btn, 'Preview (Plan)', color='lightblue', hovercolor='0.9')
+    btn_prev.on_clicked(preview_button_callback)
+
+    ax_live = plt.axes([0.66, 0.19, 0.28, 0.05])
     chk_live = CheckButtons(ax_live, ['Live Execute'], [live_update])
     chk_live.on_clicked(toggle_live_update)
 
-    current_y -= 0.06
-    ax_stop = plt.axes([0.65, current_y, 0.28, 0.05])
+    ax_sync = plt.axes([0.66, 0.13, 0.28, 0.05])
+    chk_sync = CheckButtons(ax_sync, ['Sync Model to Telemetry'], [sync_model_to_telemetry])
+    chk_sync.on_clicked(toggle_sync_model_to_telemetry)
+
+    ax_capture = plt.axes([0.66, 0.07, 0.28, 0.045])
+    btn_capture = Button(ax_capture, 'Set Current Pose as Motor+IK Zero', color='khaki', hovercolor='0.9')
+    btn_capture.on_clicked(set_current_pose_as_motor_and_ik_zero)
+
+    ax_stop = plt.axes([0.66, 0.015, 0.28, 0.05])
     btn_stop = Button(ax_stop, 'EMERGENCY STOP', color='salmon', hovercolor='red')
     btn_stop.label.set_fontweight('bold')
     btn_stop.on_clicked(emergency_stop_callback)
+    update_connection_button()
 
     print("\n--- Controls ---")
     print("Use sliders or keys to modify the GOAL target (X, Y, Z).")
@@ -721,6 +1800,8 @@ def main():
     print("Click 'Execute' to send the goal angles to the hardware and update the current state.")
     print("Click 'EMERGENCY STOP' to immediately stop all motors.")
     print("Tick 'Live Execute' to automatically execute immediately when moving.")
+    print("Tick 'Sync Model to Telemetry' to make only the ghost arm follow the real arm.")
+    print("Click 'Set Current Pose as Motor+IK Zero' to make the current physical pose zero for both motor control and IK.")
     print("Close the window to exit.")
     
     # Start pynput keyboard listener
@@ -746,10 +1827,7 @@ def main():
     listener.stop()
 
     if ser and ser.is_open:
-        # Stop everything before closing
-        send_command("S")
-        time.sleep(0.1)
-        ser.close()
+        disconnect_serial()
     print("Exited.")
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 #include "motorControl.h"
+#include <cmath>
+#include <cstring>
 
 motorControl::motorControl()
     : motors(nullptr), motorCount(0), pidIntervals(nullptr), lastUpdateTime(0) {
@@ -25,6 +27,7 @@ void motorControl::init() {
     motors[i].anglePid.integral = 0;
     // Absolute encoder fields (populated externally by goo.ino)
     motors[i].hasAbsEncoder = false;
+    motors[i].useAbsEncoderForPID = false;
     motors[i].absEncoderAngle = 0.0f;
     motors[i].absEncoderTotalAngle = 0.0f;
     motors[i].absEncoderLastRaw = 0;
@@ -88,29 +91,78 @@ void motorControl::parseMotorFeedback(struct can_frame *readMsg) {
 }
 
 void motorControl::updateMotorCommand(struct can_frame *sendMsg,
-                                      uint8_t motorIndex) {
+                                      uint8_t motorIndex, float dt) {
   if (motorIndex >= motorCount)
     return;
-
-  float dt = (micros() - lastUpdateTime) / 1000000.0f;
-  if (dt <= 0.0f)
-    dt = 0.001f;
 
   float currentCmd = 0.0f;
   motor_t *m = &motors[motorIndex];
 
   if (m->mode == MODE::SPEED) {
-    float error = m->target.speed - m->actualSpeed;
-    currentCmd = calculatePID(&m->speedPid, error, dt);
+    // Hard idle at zero target: do not run speed PID on noisy feedback.
+    if (fabsf(m->target.speed) < 0.5f) {
+      currentCmd = 0.0f;
+      m->speedPid.integral = 0.0f;
+      m->speedPid.prevError = 0.0f;
+    } else {
+      float error = m->target.speed - m->actualSpeed;
+      currentCmd = calculatePID(&m->speedPid, error, dt);
+    }
   } else if (m->mode == MODE::ANGLE) {
-    // Cascade: Position Loop -> Speed Loop
-    // Use absolute encoder angle when available, motor encoder otherwise
-    float currentAngle =
-        m->hasAbsEncoder ? m->absEncoderTotalAngle : m->totalAngle;
+    // Simplified single-loop position control:
+    // Position PID output is mapped directly to current command (A).
+    // Speed PID is bypassed entirely in ANGLE mode.
+    float currentAngle = (m->hasAbsEncoder && m->useAbsEncoderForPID)
+                             ? m->absEncoderTotalAngle
+                             : m->totalAngle;
     float posError = m->target.angle - currentAngle;
-    float targetSpeed = calculatePID(&m->anglePid, posError, dt);
-    float speedError = targetSpeed - m->actualSpeed;
-    currentCmd = calculatePID(&m->speedPid, speedError, dt);
+    float pOut = m->anglePid.kp * posError;
+    m->anglePid.integral += m->anglePid.ki * posError * dt;
+    if (m->anglePid.integral > m->anglePid.integralLimit)
+      m->anglePid.integral = m->anglePid.integralLimit;
+    if (m->anglePid.integral < -m->anglePid.integralLimit)
+      m->anglePid.integral = -m->anglePid.integralLimit;
+    float derivative = (posError - m->anglePid.prevError) / dt;
+    m->anglePid.prevError = posError;
+    float posOut = pOut + m->anglePid.integral + (m->anglePid.kd * derivative);
+
+    // Legacy compatibility: angle PID output was historically RPM-like.
+    // Convert to current with a fixed gain for direct drive.
+    // Keep this direct but not too aggressive.
+    const float kPosOutToCurrent = 0.02f; // 100 units -> 2 A
+    currentCmd = posOut * kPosOutToCurrent;
+
+    float maxCurrent = m->speedPid.outputLimit;
+    if (maxCurrent > 0.0f) {
+      if (currentCmd > maxCurrent)
+        currentCmd = maxCurrent;
+      if (currentCmd < -maxCurrent)
+        currentCmd = -maxCurrent;
+    }
+
+    float maxSpeed = m->anglePid.outputLimit;
+    if (maxSpeed > 0.0f && fabsf(m->actualSpeed) >= maxSpeed) {
+      if ((m->actualSpeed > 0.0f && currentCmd > 0.0f) ||
+          (m->actualSpeed < 0.0f && currentCmd < 0.0f)) {
+        currentCmd = 0.0f;
+      }
+    }
+
+    // Near target, bleed integrator and hard-idle to suppress periodic twitches.
+    if (fabsf(posError) < 0.20f) {
+      m->anglePid.integral *= 0.8f;
+      if (fabsf(m->anglePid.integral) < 0.02f)
+        m->anglePid.integral = 0.0f;
+      currentCmd = 0.0f;
+    }
+
+    // Wider deadband to suppress micro-chatter on encoder noise.
+    if (fabsf(currentCmd) < 0.10f && fabsf(posError) < 0.40f) {
+      currentCmd = 0.0f;
+    }
+  } else if (m->mode == MODE::CURRENT) {
+    // Direct current command (open-loop bypass of speed PID)
+    currentCmd = m->target.current;
   }
 
   if (m->direction == DIRECTION::REV)
@@ -133,6 +185,11 @@ void motorControl::updateMotorCommand(struct can_frame *sendMsg,
 
 void motorControl::refresh(uint32_t currentTime, struct can_frame *sendMsg,
                            struct can_frame *readMsg) {
+  // Unsigned subtraction handles micros() rollover correctly.
+  uint32_t deltaUs = currentTime - lastUpdateTime;
+  float dt = ((float)deltaUs) / 1000000.0f;
+  if (dt < 0.0005f || dt > 0.1f)
+    dt = 1.0f / C620_FEEDBACK_125HZ;
   lastUpdateTime = currentTime;
 
   if (readMsg && readMsg->can_id >= 0x201 && readMsg->can_id <= 0x208) {
@@ -144,7 +201,7 @@ void motorControl::refresh(uint32_t currentTime, struct can_frame *sendMsg,
 
   for (uint8_t i = 0; i < motorCount; i++) {
     if (motors[i].mode != MODE::SLEEP) {
-      updateMotorCommand(sendMsg, i);
+      updateMotorCommand(sendMsg, i, dt);
     }
   }
 }
