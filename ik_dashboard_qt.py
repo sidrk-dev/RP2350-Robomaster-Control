@@ -6,7 +6,8 @@ import traceback
 import json
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+import matplotlib.pyplot as plt
+from PySide6.QtCore import QTimer, Qt, QEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,11 +27,259 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+    QSpinBox,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import for 3D projection
 
 import ik_arm_control as backend
+
+
+WRIST_VIZ_URDF_FILE = os.path.join(os.path.dirname(__file__), "URDF", "wrist_visualization.urdf")
+
+
+class NoScrollDoubleSpinBox(QDoubleSpinBox):
+    """DoubleSpinBox that ignores mouse wheel events to prevent scroll interference."""
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoScrollSpinBox(QSpinBox):
+    """SpinBox that ignores mouse wheel events to prevent scroll interference."""
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class WristVisualizationWidget(QWidget):
+    """Dedicated 3D wrist visualization showing pitch/roll orientation and motor commands."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+        self._pitch_actual = 0.0
+        self._roll_actual = 0.0
+        self._pitch_target = None
+        self._roll_target = None
+        self._motor_a_cmd = 0.0
+        self._motor_b_cmd = 0.0
+        self._last_draw_payload = None
+        self._last_draw_time = 0.0
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Title
+        title = QLabel("Wrist Differential Visualization")
+        title.setStyleSheet("font-weight: bold; font-size: 11px;")
+        layout.addWidget(title)
+
+        # Matplotlib figure for 3D wrist view
+        self.fig = Figure(figsize=(3.5, 3.0), dpi=100)
+        self.fig.patch.set_facecolor('#f8f9fa')
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+
+        # Create 3D axis for wrist orientation
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        self.ax.set_xlim(-1.2, 1.2)
+        self.ax.set_ylim(-1.2, 1.2)
+        self.ax.set_zlim(-0.5, 0.5)
+        self.ax.set_xlabel('X', fontsize=8)
+        self.ax.set_ylabel('Y', fontsize=8)
+        self.ax.set_zlabel('Z', fontsize=8)
+        self.ax.set_title('Wrist Pose', fontsize=9)
+        self.ax.view_init(elev=20, azim=-60)
+        self.ax.set_facecolor('#f0f0f0')
+
+        # Status labels below the plot
+        status_layout = QGridLayout()
+        status_layout.setSpacing(2)
+
+        self.lbl_pitch = QLabel("Pitch: ---.-°")
+        self.lbl_pitch.setStyleSheet("font-family: monospace; color: #6a0dad;")
+        status_layout.addWidget(QLabel("Actual:"), 0, 0)
+        status_layout.addWidget(self.lbl_pitch, 0, 1)
+
+        self.lbl_roll = QLabel("Roll: ---.-°")
+        self.lbl_roll.setStyleSheet("font-family: monospace; color: #008080;")
+        status_layout.addWidget(self.lbl_roll, 0, 2, 1, 2)
+
+        self.lbl_pitch_target = QLabel("Target: ---.-°")
+        self.lbl_pitch_target.setStyleSheet("font-family: monospace; color: #ff6600;")
+        status_layout.addWidget(QLabel("Target:"), 1, 0)
+        status_layout.addWidget(self.lbl_pitch_target, 1, 1)
+
+        self.lbl_roll_target = QLabel("Target: ---.-°")
+        self.lbl_roll_target.setStyleSheet("font-family: monospace; color: #cc6600;")
+        status_layout.addWidget(self.lbl_roll_target, 1, 2, 1, 2)
+
+        layout.addLayout(status_layout)
+
+        # Motor command bars
+        motor_group = QGroupBox("Motor Commands (RPM)")
+        motor_layout = QGridLayout(motor_group)
+        motor_layout.setSpacing(2)
+
+        self.lbl_motor_a = QLabel("Motor A: ---.-")
+        self.lbl_motor_a.setStyleSheet("font-family: monospace;")
+        self.lbl_motor_b = QLabel("Motor B: ---.-")
+        self.lbl_motor_b.setStyleSheet("font-family: monospace;")
+
+        motor_layout.addWidget(QLabel("A:"), 0, 0)
+        motor_layout.addWidget(self.lbl_motor_a, 0, 1)
+        motor_layout.addWidget(QLabel("B:"), 1, 0)
+        motor_layout.addWidget(self.lbl_motor_b, 1, 1)
+
+        layout.addWidget(motor_group)
+
+        # Initialize plot elements
+        self._init_plot()
+
+    def _init_plot(self):
+        """Initialize the 3D wrist visualization elements."""
+        self.ax.cla()
+        self.ax.set_xlim(-1.2, 1.2)
+        self.ax.set_ylim(-1.2, 1.2)
+        self.ax.set_zlim(-0.5, 0.5)
+        self.ax.set_xlabel('X', fontsize=8)
+        self.ax.set_ylabel('Y', fontsize=8)
+        self.ax.set_zlabel('Z', fontsize=8)
+        self.ax.set_title('Wrist Pose', fontsize=9)
+        self.ax.set_facecolor('#f0f0f0')
+
+        # Draw coordinate frame at origin
+        self.ax.quiver(0, 0, 0, 0.8, 0, 0, color='red', arrow_length_ratio=0.15, linewidth=1.5)
+        self.ax.quiver(0, 0, 0, 0, 0.8, 0, color='green', arrow_length_ratio=0.15, linewidth=1.5)
+        self.ax.quiver(0, 0, 0, 0, 0, 0.4, color='blue', arrow_length_ratio=0.15, linewidth=1.5)
+
+        # Draw wrist plate (circle representing the wrist plane)
+        theta = np.linspace(0, 2 * np.pi, 50)
+        radius = 0.6
+        x_circle = radius * np.cos(theta)
+        y_circle = radius * np.sin(theta)
+        z_circle = np.zeros_like(theta)
+        self.wrist_plate, = self.ax.plot(x_circle, y_circle, z_circle, 'b-', linewidth=2, alpha=0.6)
+
+        # Pitch indicator (vertical bar)
+        self.pitch_line, = self.ax.plot([0, 0], [0, 0], [-0.3, 0.3], 'purple', linewidth=3, label='Pitch')
+
+        # Roll indicator (horizontal bar)
+        self.roll_line, = self.ax.plot([0, 0], [0, 0], [0, 0], 'teal', linewidth=3, label='Roll')
+
+        # Target crosshairs
+        self.target_pitch, = self.ax.plot([0, 0], [0, 0], [-0.25, 0.25], 'orange', linewidth=1.5, linestyle='--', alpha=0.7)
+        self.target_roll, = self.ax.plot([0, 0], [0, 0], [0, 0], 'darkorange', linewidth=1.5, linestyle='--', alpha=0.7)
+
+        self.ax.legend(loc='upper left', fontsize=7)
+
+    def update_wrist(self, pitch_actual, roll_actual, pitch_target, roll_target, motor_a_cmd, motor_b_cmd):
+        """Update the wrist visualization with new data."""
+        self._pitch_actual = pitch_actual if pitch_actual is not None else 0.0
+        self._roll_actual = roll_actual if roll_actual is not None else 0.0
+        self._pitch_target = pitch_target
+        self._roll_target = roll_target
+        self._motor_a_cmd = motor_a_cmd if motor_a_cmd is not None else 0.0
+        self._motor_b_cmd = motor_b_cmd if motor_b_cmd is not None else 0.0
+        payload = (
+            round(float(self._pitch_actual), 1),
+            round(float(self._roll_actual), 1),
+            None if self._pitch_target is None else round(float(self._pitch_target), 1),
+            None if self._roll_target is None else round(float(self._roll_target), 1),
+            round(float(self._motor_a_cmd), 1),
+            round(float(self._motor_b_cmd), 1),
+        )
+        now = time.time()
+        should_redraw = (payload != self._last_draw_payload) or ((now - self._last_draw_time) >= 0.25)
+        self._update_labels()
+        if should_redraw:
+            self._redraw()
+            self._last_draw_payload = payload
+            self._last_draw_time = now
+
+    def _redraw(self):
+        """Redraw the 3D visualization."""
+        self.ax.cla()
+        self.ax.set_xlim(-1.2, 1.2)
+        self.ax.set_ylim(-1.2, 1.2)
+        self.ax.set_zlim(-0.5, 0.5)
+        self.ax.set_xlabel('X', fontsize=8)
+        self.ax.set_ylabel('Y', fontsize=8)
+        self.ax.set_zlabel('Z', fontsize=8)
+        self.ax.set_title('Wrist Pose', fontsize=9)
+        self.ax.set_facecolor('#f0f0f0')
+
+        # Base coordinate frame
+        self.ax.quiver(0, 0, 0, 0.8, 0, 0, color='red', arrow_length_ratio=0.15, linewidth=1.5)
+        self.ax.quiver(0, 0, 0, 0, 0.8, 0, color='green', arrow_length_ratio=0.15, linewidth=1.5)
+        self.ax.quiver(0, 0, 0, 0, 0, 0.4, color='blue', arrow_length_ratio=0.15, linewidth=1.5)
+
+        # Wrist plate (tilted by pitch and roll)
+        pitch_rad = np.radians(self._pitch_actual)
+        roll_rad = np.radians(self._roll_actual)
+
+        theta = np.linspace(0, 2 * np.pi, 50)
+        radius = 0.6
+        x_base = radius * np.cos(theta)
+        y_base = radius * np.sin(theta)
+
+        # Apply rotation: pitch rotates around Y, roll rotates around X
+        x_tilted = x_base * np.cos(roll_rad) + 0 * np.sin(roll_rad)
+        y_tilted = y_base * np.cos(pitch_rad)
+        z_tilted = x_base * np.sin(roll_rad) + y_base * np.sin(pitch_rad) * 0.5
+
+        self.ax.plot(x_tilted, y_tilted, z_tilted, 'b-', linewidth=2, alpha=0.6)
+
+        # Pitch indicator (vertical line through center, tilted)
+        pitch_z = 0.35 * np.sin(pitch_rad)
+        self.ax.plot([0, 0], [0, 0], [-0.3 + pitch_z, 0.3 + pitch_z], 'purple', linewidth=3, label='Pitch')
+
+        # Roll indicator (horizontal line through center, tilted)
+        roll_x = 0.35 * np.sin(roll_rad)
+        self.ax.plot([-0.3 + roll_x, 0.3 + roll_x], [0, 0], [0, 0], 'teal', linewidth=3, label='Roll')
+
+        # Target crosshairs (if set)
+        if self._pitch_target is not None:
+            tgt_pitch_rad = np.radians(self._pitch_target)
+            tgt_pitch_z = 0.25 * np.sin(tgt_pitch_rad)
+            self.ax.plot([0, 0], [0, 0], [-0.25 + tgt_pitch_z, 0.25 + tgt_pitch_z],
+                         'orange', linewidth=1.5, linestyle='--', alpha=0.7, label='Tgt Pitch')
+
+        if self._roll_target is not None:
+            tgt_roll_rad = np.radians(self._roll_target)
+            tgt_roll_x = 0.25 * np.sin(tgt_roll_rad)
+            self.ax.plot([-0.25 + tgt_roll_x, 0.25 + tgt_roll_x], [0, 0], [0, 0],
+                         'darkorange', linewidth=1.5, linestyle='--', alpha=0.7, label='Tgt Roll')
+
+        # Motor command indicators (small arrows on the side)
+        motor_scale = 0.005  # Scale RPM to visual length
+        if abs(self._motor_a_cmd) > 0.5:
+            direction = 1 if self._motor_a_cmd > 0 else -1
+            length = min(abs(self._motor_a_cmd) * motor_scale, 0.4)
+            self.ax.quiver(-0.8, 0.5, 0, 0, direction * length, 0, color='darkred',
+                          arrow_length_ratio=0.2, linewidth=2)
+            self.ax.text(-0.8, 0.5 + direction * 0.15, 0, f'A:{int(self._motor_a_cmd)}', fontsize=7, color='darkred')
+
+        if abs(self._motor_b_cmd) > 0.5:
+            direction = 1 if self._motor_b_cmd > 0 else -1
+            length = min(abs(self._motor_b_cmd) * motor_scale, 0.4)
+            self.ax.quiver(-0.8, -0.5, 0, 0, direction * length, 0, color='darkblue',
+                          arrow_length_ratio=0.2, linewidth=2)
+            self.ax.text(-0.8, -0.5 + direction * 0.15, 0, f'B:{int(self._motor_b_cmd)}', fontsize=7, color='darkblue')
+
+        self.ax.legend(loc='upper left', fontsize=7)
+        self.canvas.draw_idle()
+
+    def _update_labels(self):
+        """Update the status labels."""
+        self.lbl_pitch.setText(f"Pitch: {_fmt_deg(self._pitch_actual)}")
+        self.lbl_roll.setText(f"Roll: {_fmt_deg(self._roll_actual)}")
+        self.lbl_pitch_target.setText(f"Target: {_fmt_deg(self._pitch_target)}")
+        self.lbl_roll_target.setText(f"Target: {_fmt_deg(self._roll_target)}")
+        self.lbl_motor_a.setText(f"Motor A: {_fmt_rpm(self._motor_a_cmd)} RPM")
+        self.lbl_motor_b.setText(f"Motor B: {_fmt_rpm(self._motor_b_cmd)} RPM")
 
 
 KEYMAP_FILE = os.path.join(os.path.dirname(__file__), "ik_dashboard_keys.json")
@@ -63,6 +312,8 @@ DEFAULT_KEYMAP = {
     "estop": "X",
     "preview": "P",
     "sync_target": "C",
+    "hand_open": "T",
+    "hand_close": "G",
 }
 ACTION_LABELS = {
     "move_x_neg": "Move X-",
@@ -85,6 +336,8 @@ ACTION_LABELS = {
     "estop": "E-Stop",
     "preview": "Preview",
     "sync_target": "Target Sync",
+    "hand_open": "Hand Open",
+    "hand_close": "Hand Close",
 }
 
 
@@ -94,6 +347,13 @@ def _fmt_deg(value):
 
 def _fmt_rpm(value):
     return "---.-" if value is None else f"{float(value):7.1f}"
+
+
+def get_hand_dashboard_snapshot():
+    return {
+        "pwm": int(getattr(backend, "hand_pwm_command", 0)),
+        "controller": "wrist",
+    }
 
 
 def get_wrist_dashboard_snapshot():
@@ -125,20 +385,30 @@ def get_wrist_dashboard_snapshot():
 
 class ArmCanvas(FigureCanvas):
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(9.4, 8.8))
+        self.figure = Figure(figsize=(9.4, 9.2))
         super().__init__(self.figure)
         self.setParent(parent)
-        gs = self.figure.add_gridspec(2, 2, height_ratios=[3.3, 1.4], hspace=0.08, wspace=0.05)
+        # Layout: top row = 3D + Side view, bottom row = status + wrist differential
+        gs = self.figure.add_gridspec(2, 2, height_ratios=[2.7, 1.25], width_ratios=[1.45, 1.0], hspace=0.10, wspace=0.08)
         self.ax = self.figure.add_subplot(gs[0, 0], projection="3d")
         self.ax_side = self.figure.add_subplot(gs[0, 1], projection="3d")
+        self.ax_wrist = self.figure.add_subplot(gs[1, 1], projection="3d")
         self.ax_top = None
-        self.ax_status = self.figure.add_subplot(gs[1, :])
+        self.ax_status = self.figure.add_subplot(gs[1, 0])
         self.figure.subplots_adjust(left=0.03, right=0.99, top=0.98, bottom=0.04)
+        self._wrist_anim_frame = 0
+        self.wrist_chain = None
+        if os.path.exists(WRIST_VIZ_URDF_FILE):
+            try:
+                self.wrist_chain = backend.Chain.from_urdf_file(WRIST_VIZ_URDF_FILE)
+            except Exception:
+                self.wrist_chain = None
 
     def draw_arm(self):
         self.ax.cla()
         self.ax_side.cla()
         self.ax_status.cla()
+        self.ax_wrist.cla()
         for axis in (self.ax, self.ax_side):
             axis.set_xlim(-0.9, 0.9)
             axis.set_ylim(-0.9, 0.9)
@@ -198,6 +468,9 @@ class ArmCanvas(FigureCanvas):
             lines.append(
                 f"Mix Cmd M{wrist['motor_a_id']}/{wrist['motor_b_id']}: {_fmt_rpm(wrist['motor_a_cmd']).strip()} / {_fmt_rpm(wrist['motor_b_cmd']).strip()} RPM"
             )
+        hand = get_hand_dashboard_snapshot()
+        lines.append("")
+        lines.append(f"Hand PWM ({hand['controller']}): {hand['pwm']}")
         self.ax_status.text(
             0.02,
             0.98,
@@ -208,7 +481,85 @@ class ArmCanvas(FigureCanvas):
             family="monospace",
             bbox=dict(facecolor="#f4f4f4", edgecolor="black", boxstyle="round,pad=0.5"),
         )
+
+        # Draw wrist differential visualization
+        self._draw_wrist_differential(wrist)
+
         self.draw_idle()
+
+    def _draw_wrist_differential(self, wrist):
+        """Draw the wrist using a wrist-only URDF chain driven by pitch and roll."""
+        ax = self.ax_wrist
+        ax.set_xlim(-0.22, 0.22)
+        ax.set_ylim(-0.22, 0.22)
+        ax.set_zlim(-0.02, 0.28)
+        ax.set_xlabel("X", fontsize=7)
+        ax.set_ylabel("Y", fontsize=7)
+        ax.set_zlabel("Z", fontsize=7)
+        ax.set_title("Wrist Differential", fontsize=10, fontweight="bold")
+        ax.view_init(elev=22, azim=-50)
+
+        if wrist is None or not backend.wrist_diff_enabled() or self.wrist_chain is None:
+            ax.text(
+                0.0,
+                0.0,
+                0.12,
+                "Wrist\nDisabled",
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="#7a7a7a",
+                fontweight="bold",
+            )
+            return
+
+        pitch_actual = wrist.get("pitch_actual") if wrist.get("pitch_actual") is not None else 0.0
+        roll_actual = wrist.get("roll_actual") if wrist.get("roll_actual") is not None else 0.0
+        pitch_target = wrist.get("pitch_target")
+        roll_target = wrist.get("roll_target")
+        motor_a_cmd = wrist.get("motor_a_cmd") if wrist.get("motor_a_cmd") is not None else 0.0
+        motor_b_cmd = wrist.get("motor_b_cmd") if wrist.get("motor_b_cmd") is not None else 0.0
+
+        actual_angles = [0.0] * len(self.wrist_chain.links)
+        actual_angles[1] = np.radians(float(pitch_actual))
+        actual_angles[2] = np.radians(float(roll_actual))
+        target_angles = [0.0] * len(self.wrist_chain.links)
+        target_angles[1] = np.radians(float(pitch_actual if pitch_target is None else pitch_target))
+        target_angles[2] = np.radians(float(roll_actual if roll_target is None else roll_target))
+
+        actual_fk = self.wrist_chain.forward_kinematics(actual_angles, full_kinematics=True)
+        target_fk = self.wrist_chain.forward_kinematics(target_angles, full_kinematics=True)
+        actual_x = [p[0, 3] for p in actual_fk]
+        actual_y = [p[1, 3] for p in actual_fk]
+        actual_z = [p[2, 3] for p in actual_fk]
+        target_x = [p[0, 3] for p in target_fk]
+        target_y = [p[1, 3] for p in target_fk]
+        target_z = [p[2, 3] for p in target_fk]
+
+        ax.plot(target_x, target_y, target_z, "-o", color="darkorange", alpha=0.35, linewidth=4, markersize=7)
+        ax.plot(actual_x, actual_y, actual_z, "-o", color="tab:blue", linewidth=4, markersize=8)
+
+        tool = target_fk[-1]
+        origin = tool[:3, 3]
+        rot = tool[:3, :3]
+        axis_len = 0.05
+        ax.quiver(origin[0], origin[1], origin[2], rot[0, 0] * axis_len, rot[1, 0] * axis_len, rot[2, 0] * axis_len, color="red", arrow_length_ratio=0.25, linewidth=1.3)
+        ax.quiver(origin[0], origin[1], origin[2], rot[0, 1] * axis_len, rot[1, 1] * axis_len, rot[2, 1] * axis_len, color="green", arrow_length_ratio=0.25, linewidth=1.3)
+        ax.quiver(origin[0], origin[1], origin[2], rot[0, 2] * axis_len, rot[1, 2] * axis_len, rot[2, 2] * axis_len, color="blue", arrow_length_ratio=0.25, linewidth=1.3)
+
+        ax.text2D(
+            0.03,
+            0.95,
+            f"Pitch  cur {_fmt_deg(pitch_actual).strip()}   tgt {_fmt_deg(pitch_target).strip()}\n"
+            f"Roll   cur {_fmt_deg(roll_actual).strip()}   tgt {_fmt_deg(roll_target).strip()}\n"
+            f"Mix M{wrist['motor_a_id']}/{wrist['motor_b_id']}: {_fmt_rpm(motor_a_cmd).strip()} / {_fmt_rpm(motor_b_cmd).strip()} RPM",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            family="monospace",
+            bbox=dict(facecolor="#f8fafc", edgecolor="#cbd5e1", boxstyle="round,pad=0.35"),
+        )
 
 
 class DashboardWindow(QMainWindow):
@@ -221,6 +572,16 @@ class DashboardWindow(QMainWindow):
         self._last_status_snapshot = ""
         self._pressed_keys = set()
         self._key_action_fired = set()
+        self._hand_key_active = None
+        self._editing_inputs = set()  # Track inputs being edited
+        self._last_connection_state = None
+        self._last_status_text = ""
+        self._last_pressed_text = ""
+        self._last_indicator_snapshot = None
+        self._last_telemetry_text = ""
+        self._last_table_values = {}
+        self._last_telemetry_live = False
+        self._last_auto_apply_time = 0.0
         self.keymap = self._load_keymap()
         self.keymap_inputs = {}
         self.key_indicator_labels = {}
@@ -343,6 +704,54 @@ class DashboardWindow(QMainWindow):
         self.btn_sync_target.clicked.connect(lambda: self.sync_target_from_telemetry())
         controls_layout.addWidget(self.btn_sync_target, 6, 1)
 
+        self.joint_speed_input = NoScrollSpinBox()
+        self.joint_speed_input.setRange(1, 360)
+        self.joint_speed_input.setSingleStep(1)
+        self.joint_speed_input.setValue(20)
+        self.joint_speed_input.valueChanged.connect(lambda _: self._apply_joint_speed_setting(log_change=True))
+        controls_layout.addWidget(QLabel("Joint Speed (deg/s)"), 7, 0)
+        controls_layout.addWidget(self.joint_speed_input, 7, 1)
+
+        status_group = QGroupBox("Link Status")
+        status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(6, 6, 6, 6)
+        status_layout.setSpacing(4)
+        left_layout.addWidget(status_group)
+
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        status_layout.addWidget(self.status_label)
+
+        tele_group = QGroupBox("Telemetry")
+        tele_group_layout = QVBoxLayout(tele_group)
+        tele_group_layout.setContentsMargins(6, 6, 6, 6)
+        tele_group_layout.setSpacing(4)
+        left_layout.addWidget(tele_group)
+
+        self.telemetry_view = QTextEdit()
+        self.telemetry_view.setReadOnly(True)
+        self.telemetry_view.setMinimumHeight(160)
+        tele_group_layout.addWidget(self.telemetry_view)
+
+        hand_group = QGroupBox("Hand")
+        hand_layout = QGridLayout(hand_group)
+        hand_layout.setHorizontalSpacing(4)
+        hand_layout.setVerticalSpacing(4)
+        left_layout.addWidget(hand_group)
+
+        self.btn_hand_open = QPushButton("Open")
+        self.btn_hand_open.clicked.connect(lambda: self.hand_open())
+        hand_layout.addWidget(self.btn_hand_open, 0, 0)
+
+        self.btn_hand_close = QPushButton("Close")
+        self.btn_hand_close.clicked.connect(lambda: self.hand_close())
+        hand_layout.addWidget(self.btn_hand_close, 0, 1)
+
+        self.btn_hand_stop = QPushButton("Stop")
+        self.btn_hand_stop.clicked.connect(lambda: self.hand_stop())
+        hand_layout.addWidget(self.btn_hand_stop, 1, 0, 1, 2)
+
         camera_group = QGroupBox("Camera")
         camera_layout = QGridLayout(camera_group)
         camera_layout.setHorizontalSpacing(4)
@@ -378,7 +787,7 @@ class DashboardWindow(QMainWindow):
         self.target_inputs = {}
         for row, key in enumerate(("x", "y", "z", "roll", "pitch", "yaw")):
             label = QLabel(key.upper())
-            spin = QDoubleSpinBox()
+            spin = NoScrollDoubleSpinBox()
             spin.setDecimals(3)
             spin.setSingleStep(0.01)
             if key == "z":
@@ -390,11 +799,12 @@ class DashboardWindow(QMainWindow):
             else:
                 spin.setRange(-1.0, 1.0)
             spin.valueChanged.connect(self.on_target_changed)
+            spin.installEventFilter(self)  # Track focus for editing
             target_layout.addWidget(label, row, 0)
             target_layout.addWidget(spin, row, 1)
             self.target_inputs[key] = spin
 
-        self.step_input = QDoubleSpinBox()
+        self.step_input = NoScrollDoubleSpinBox()
         self.step_input.setDecimals(3)
         self.step_input.setRange(0.001, 0.05)
         self.step_input.setSingleStep(0.001)
@@ -411,33 +821,24 @@ class DashboardWindow(QMainWindow):
         self.joint_inputs = {}
         for row, joint_idx in enumerate(range(1, 7)):
             label = QLabel(f"J{joint_idx}")
-            spin = QDoubleSpinBox()
+            spin = NoScrollDoubleSpinBox()
             spin.setDecimals(2)
             spin.setRange(-360.0, 360.0)
             spin.setSingleStep(1.0)
             spin.valueChanged.connect(lambda value, idx=joint_idx: self.on_joint_changed(idx, value))
+            spin.installEventFilter(self)  # Track focus for editing
             joint_layout.addWidget(label, row, 0)
             joint_layout.addWidget(spin, row, 1)
             self.joint_inputs[joint_idx] = spin
-
-        status_group = QGroupBox("Status")
-        status_layout = QVBoxLayout(status_group)
-        status_layout.setContentsMargins(6, 6, 6, 6)
-        status_layout.setSpacing(4)
-        left_layout.addWidget(status_group)
-
-        self.status_label = QLabel()
-        self.status_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        status_layout.addWidget(self.status_label)
 
         self.joint_table = QTableWidget(6, 4)
         self.joint_table.setHorizontalHeaderLabels(["Joint", "Target", "Current", "Error"])
         self.joint_table.verticalHeader().setVisible(False)
         self.joint_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        status_layout.addWidget(self.joint_table)
+        left_layout.addWidget(self.joint_table)
 
         tabs = QTabWidget()
+        self.info_tabs = tabs
         left_layout.addWidget(tabs, 1)
 
         log_tab = QWidget()
@@ -449,10 +850,19 @@ class DashboardWindow(QMainWindow):
 
         tele_tab = QWidget()
         tele_layout = QVBoxLayout(tele_tab)
-        self.telemetry_view = QTextEdit()
-        self.telemetry_view.setReadOnly(True)
-        tele_layout.addWidget(self.telemetry_view)
+        self.telemetry_detail_view = QTextEdit()
+        self.telemetry_detail_view.setReadOnly(True)
+        tele_layout.addWidget(self.telemetry_detail_view)
         tabs.addTab(tele_tab, "Telemetry")
+        self.telemetry_tab_index = tabs.indexOf(tele_tab)
+
+        # Wrist visualization tab
+        wrist_viz_tab = QWidget()
+        wrist_viz_layout = QVBoxLayout(wrist_viz_tab)
+        self.wrist_viz_widget = WristVisualizationWidget()
+        wrist_viz_layout.addWidget(self.wrist_viz_widget)
+        tabs.addTab(wrist_viz_tab, "Wrist Viz")
+        self.wrist_viz_tab_index = tabs.indexOf(wrist_viz_tab)
 
         help_tab = QWidget()
         help_layout = QVBoxLayout(help_tab)
@@ -502,7 +912,7 @@ class DashboardWindow(QMainWindow):
             "move_x_neg", "move_x_pos", "move_y_pos", "move_y_neg", "move_z_neg", "move_z_pos",
             "roll_neg", "roll_pos", "pitch_pos", "pitch_neg", "yaw_neg", "yaw_pos",
             "cam_left", "cam_right", "cam_up", "cam_down",
-            "execute", "preview", "sync_target", "estop",
+            "execute", "preview", "sync_target", "estop", "hand_open", "hand_close",
         ]
         for row, action in enumerate(action_order):
             label = QLabel(ACTION_LABELS[action])
@@ -565,9 +975,10 @@ class DashboardWindow(QMainWindow):
 
     def on_keymap_changed(self, action, value):
         self.keymap[action] = value if value in KEY_OPTIONS else "None"
-        self.refresh_all(skip_inputs=True)
+        self.refresh_all(skip_inputs=True, draw_canvas=False)
 
     def _connect_serial_passive(self):
+        was_connected = bool(backend.ser and backend.ser.is_open)
         old_auto_zero = getattr(backend, "AUTO_MOVE_TO_ZERO_ON_CONNECT", True)
         try:
             backend.AUTO_MOVE_TO_ZERO_ON_CONNECT = False
@@ -580,12 +991,31 @@ class DashboardWindow(QMainWindow):
             self._append_log("Connected serial device; telemetry is live.")
         else:
             self._append_log("Connected serial device; waiting for telemetry.")
+        if was_connected:
+            self._apply_runtime_config_bundle("manual reconnect")
+        else:
+            self._last_auto_apply_time = time.time()
+        self._last_telemetry_live = bool(backend.has_fresh_telemetry())
         return True
+
+    def _apply_runtime_config_bundle(self, reason):
+        try:
+            backend.send_command("S; TON")
+            backend.load_robot_config()
+            applied = backend.apply_robot_config_to_arm()
+            if applied:
+                self._append_log(f"Auto-applied config/ENCMAP/ABSPID after {reason}.")
+            else:
+                self._append_log(f"Auto-apply skipped after {reason} (missing serial/config).")
+            return applied
+        except Exception as exc:
+            self._append_log(f"Auto-apply failed after {reason}: {exc}")
+            return False
 
     def _start_timers(self):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_all)
-        self.refresh_timer.start(100)
+        self.refresh_timer.start(250)
 
         self.live_timer = QTimer(self)
         self.live_timer.timeout.connect(self._live_execute_tick)
@@ -593,7 +1023,16 @@ class DashboardWindow(QMainWindow):
 
         self.keyboard_timer = QTimer(self)
         self.keyboard_timer.timeout.connect(self._keyboard_tick)
-        self.keyboard_timer.start(40)
+        self.keyboard_timer.start(50)  # Slightly slower for responsiveness
+
+    def _apply_joint_speed_setting(self, log_change=False):
+        if not hasattr(self, "joint_speed_input"):
+            return
+        speed = max(1.0, float(self.joint_speed_input.value()))
+        prev_speed = float(getattr(backend, "MAX_COMMAND_RATE_DEG_PER_SEC", speed))
+        backend.MAX_COMMAND_RATE_DEG_PER_SEC = speed
+        if log_change and abs(prev_speed - speed) > 1e-6:
+            self._append_log(f"Joint speed set to {speed:.0f} deg/s.")
 
     def _append_log(self, message):
         stamp = time.strftime("%H:%M:%S")
@@ -605,6 +1044,7 @@ class DashboardWindow(QMainWindow):
             self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _send_current_joint_target(self, smooth=False, repeat_count=1):
+        self._apply_joint_speed_setting(log_change=False)
         backend.current_joint_angles = backend.clamp_seed_angles_to_bounds(
             backend.enforce_locked_joints(backend.current_joint_angles)
         )
@@ -614,7 +1054,7 @@ class DashboardWindow(QMainWindow):
             backend.current_joint_angles,
             smooth=smooth,
             max_ramp_steps=20 if smooth else 1,
-            force_immediate=True,
+            force_immediate=False,
             repeat_count=repeat_count,
         )
         backend.last_send_time = time.time()
@@ -632,13 +1072,17 @@ class DashboardWindow(QMainWindow):
         self.refresh_all()
 
     def execute_now(self):
-        self._send_current_joint_target(smooth=False, repeat_count=3)
+        self._send_current_joint_target(smooth=True, repeat_count=1)
         self._append_log("Execute requested.")
         self.refresh_all()
 
     def preview_plan(self):
-        backend.actual_joint_angles = list(backend.current_joint_angles)
-        self._append_log("Preview pose updated to current target.")
+        if backend.actual_joint_angles is None:
+            tele_angles = backend.get_current_real_joint_angles()
+            backend.actual_joint_angles = list(tele_angles) if tele_angles is not None else list(backend.current_joint_angles)
+        backend.is_previewing = True
+        backend.preview_start_time = time.time()
+        self._append_log("Preview animation started (current -> target).")
         self.refresh_all()
 
     def estop(self):
@@ -660,6 +1104,42 @@ class DashboardWindow(QMainWindow):
         moved = backend.move_configured_joints_to_zero_on_connect()
         self._append_log("Move-to-zero requested." if moved else "Move-to-zero skipped.")
         self.refresh_all()
+
+    def hand_open(self):
+        backend.open_hand(255)
+        self._append_log("Hand open requested.")
+        self.refresh_all(skip_inputs=True)
+
+    def hand_close(self):
+        backend.close_hand(255)
+        self._append_log("Hand close requested.")
+        self.refresh_all(skip_inputs=True)
+
+    def hand_stop(self):
+        backend.stop_hand()
+        self._append_log("Hand stop requested.")
+        self.refresh_all(skip_inputs=True)
+
+    def _set_hand_from_keys(self, actions):
+        open_pressed = "hand_open" in actions
+        close_pressed = "hand_close" in actions
+        desired = None
+        if open_pressed and not close_pressed:
+            desired = "open"
+        elif close_pressed and not open_pressed:
+            desired = "close"
+        if desired == self._hand_key_active:
+            return
+        if desired == "open":
+            backend.open_hand(255)
+            self._hand_key_active = desired
+        elif desired == "close":
+            backend.close_hand(255)
+            self._hand_key_active = desired
+        else:
+            if self._hand_key_active is not None:
+                backend.stop_hand()
+            self._hand_key_active = None
 
     def toggle_live_execute(self, checked):
         backend.live_update = bool(checked)
@@ -721,6 +1201,9 @@ class DashboardWindow(QMainWindow):
 
     def _keyboard_tick(self):
         if not self._pressed_keys:
+            if self._hand_key_active is not None:
+                backend.stop_hand()
+                self._hand_key_active = None
             self._key_action_fired.clear()
             return
 
@@ -730,6 +1213,7 @@ class DashboardWindow(QMainWindow):
         changed = False
 
         actions = self._pressed_actions()
+        self._set_hand_from_keys(actions)
 
         if "move_x_neg" in actions:
             backend.current_target_xyz[0] -= move_step
@@ -810,13 +1294,13 @@ class DashboardWindow(QMainWindow):
         if solved is not None:
             backend.current_joint_angles = list(solved)
             backend.refresh_locked_joint_rads(backend.current_joint_angles)
-        self.refresh_all(skip_inputs=False)
+        self.refresh_all(skip_inputs=False, draw_canvas=False)
 
     def keyPressEvent(self, event):
         mapped = self._event_to_key_name(event)
         if mapped is not None:
             self._pressed_keys.add(mapped.lower())
-            self.refresh_all(skip_inputs=True)
+            self.refresh_all(skip_inputs=True, draw_canvas=False)
             event.accept()
             return
         super().keyPressEvent(event)
@@ -825,10 +1309,37 @@ class DashboardWindow(QMainWindow):
         mapped = self._event_to_key_name(event)
         if mapped is not None and mapped.lower() in self._pressed_keys:
             self._pressed_keys.discard(mapped.lower())
-            self.refresh_all(skip_inputs=True)
+            self.refresh_all(skip_inputs=True, draw_canvas=False)
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    def eventFilter(self, obj, event):
+        """Track when inputs are being edited to prevent overwriting."""
+        # Check if attributes exist (they may not during initialization)
+        if not hasattr(self, '_editing_inputs'):
+            return super().eventFilter(obj, event)
+        
+        # Find which input this is
+        input_key = None
+        if hasattr(self, 'target_inputs'):
+            for key, spin in self.target_inputs.items():
+                if spin is obj:
+                    input_key = key
+                    break
+        if input_key is None and hasattr(self, 'joint_inputs'):
+            for joint_idx, spin in self.joint_inputs.items():
+                if spin is obj:
+                    input_key = f"joint_{joint_idx}"
+                    break
+        
+        if input_key is not None:
+            if event.type() == QEvent.Type.FocusIn:
+                self._editing_inputs.add(input_key)
+            elif event.type() == QEvent.Type.FocusOut:
+                self._editing_inputs.discard(input_key)
+        
+        return super().eventFilter(obj, event)
 
     def on_target_changed(self):
         if self._building_controls:
@@ -871,46 +1382,77 @@ class DashboardWindow(QMainWindow):
                 self._send_current_joint_target(smooth=False, repeat_count=1)
                 self.refresh_all(skip_inputs=True)
 
-    def refresh_all(self, skip_inputs=False):
+    def refresh_all(self, skip_inputs=False, draw_canvas=True):
         self._building_controls = True
         try:
             if not skip_inputs:
-                self.target_inputs["x"].setValue(float(backend.current_target_xyz[0]))
-                self.target_inputs["y"].setValue(float(backend.planar_target_y if backend.PLANAR_MODE else backend.current_target_xyz[1]))
-                self.target_inputs["z"].setValue(float(backend.current_target_xyz[2]))
-                self.target_inputs["roll"].setValue(float(backend.current_target_rpy[0]))
-                self.target_inputs["pitch"].setValue(float(backend.current_target_rpy[1]))
-                self.target_inputs["yaw"].setValue(float(backend.current_target_rpy[2]))
+                # Only update inputs that are not being edited
+                for key in ("x", "y", "z", "roll", "pitch", "yaw"):
+                    if key not in self._editing_inputs:
+                        if key == "x":
+                            self.target_inputs[key].setValue(float(backend.current_target_xyz[0]))
+                        elif key == "y":
+                            self.target_inputs[key].setValue(float(backend.planar_target_y if backend.PLANAR_MODE else backend.current_target_xyz[1]))
+                        elif key == "z":
+                            self.target_inputs[key].setValue(float(backend.current_target_xyz[2]))
+                        elif key == "roll":
+                            self.target_inputs[key].setValue(float(backend.current_target_rpy[0]))
+                        elif key == "pitch":
+                            self.target_inputs[key].setValue(float(backend.current_target_rpy[1]))
+                        elif key == "yaw":
+                            self.target_inputs[key].setValue(float(backend.current_target_rpy[2]))
                 for joint_idx in range(1, 7):
-                    if joint_idx < len(backend.current_joint_angles):
+                    if f"joint_{joint_idx}" not in self._editing_inputs and joint_idx < len(backend.current_joint_angles):
                         self.joint_inputs[joint_idx].setValue(float(np.degrees(backend.current_joint_angles[joint_idx])))
 
             connected = bool(backend.ser and backend.ser.is_open)
-            if connected and backend.has_fresh_telemetry():
-                self.btn_connect.setText("Connected")
-                self.btn_connect.setStyleSheet("background-color: lightgreen;")
+            telemetry_live = bool(connected and backend.has_fresh_telemetry())
+            if telemetry_live and not self._last_telemetry_live:
+                now = time.time()
+                if (now - self._last_auto_apply_time) >= 2.0:
+                    self._apply_runtime_config_bundle("telemetry reconnect")
+                    self._last_auto_apply_time = now
+            self._last_telemetry_live = telemetry_live
+
+            if telemetry_live:
+                conn_state = ("Connected", "background-color: lightgreen;")
             elif connected:
-                self.btn_connect.setText("Port Open")
-                self.btn_connect.setStyleSheet("background-color: khaki;")
+                conn_state = ("Port Open", "background-color: khaki;")
             else:
-                self.btn_connect.setText("Disconnected")
-                self.btn_connect.setStyleSheet("background-color: lightcoral;")
+                conn_state = ("Disconnected", "background-color: lightcoral;")
+            if conn_state != self._last_connection_state:
+                self.btn_connect.setText(conn_state[0])
+                self.btn_connect.setStyleSheet(conn_state[1])
+                self._last_connection_state = conn_state
 
             self.btn_estop.setStyleSheet("background-color: salmon; font-weight: bold;")
-            self.status_label.setText(backend.get_connection_status_text() + f"\nLast Telemetry: {backend.last_telemetry_line}")
+            status_text = backend.get_connection_status_text() + f"\nLast Telemetry: {backend.last_telemetry_line}"
+            if status_text != self._last_status_text:
+                self.status_label.setText(status_text)
+                self._last_status_text = status_text
             self.chk_live.setChecked(bool(backend.live_update))
             self.chk_sync.setChecked(bool(backend.sync_model_to_telemetry))
             self.chk_mirror.setChecked(bool(backend.DISPLAY_MIRROR_X))
             pressed = self._sorted_pressed_keys()
-            self.keys_status.setText("Pressed: " + (", ".join(pressed) if pressed else "<none>"))
+            pressed_text = "Pressed: " + (", ".join(pressed) if pressed else "<none>")
+            if pressed_text != self._last_pressed_text:
+                self.keys_status.setText(pressed_text)
+                self._last_pressed_text = pressed_text
             active_actions = self._pressed_actions()
-            for action, label in self.key_indicator_labels.items():
-                key_name = self.keymap.get(action, "None")
-                label.setText(key_name)
-                if action in active_actions:
-                    label.setStyleSheet("background-color: #6fda8c; color: #0b2b12; border: 1px solid #2d7a40; border-radius: 4px; font-weight: bold;")
-                else:
-                    label.setStyleSheet("background-color: #e9ecef; color: #222; border: 1px solid #c5c9ce; border-radius: 4px; font-weight: bold;")
+            indicator_snapshot = (
+                tuple(sorted(active_actions)),
+                tuple((a, self.keymap.get(a, "None")) for a in sorted(self.key_indicator_labels.keys())),
+            )
+            if indicator_snapshot != self._last_indicator_snapshot:
+                for action, label in self.key_indicator_labels.items():
+                    key_name = self.keymap.get(action, "None")
+                    if label.text() != key_name:
+                        label.setText(key_name)
+                    if action in active_actions:
+                        label.setStyleSheet("background-color: #6fda8c; color: #0b2b12; border: 1px solid #2d7a40; border-radius: 4px; font-weight: bold;")
+                    else:
+                        label.setStyleSheet("background-color: #e9ecef; color: #222; border: 1px solid #c5c9ce; border-radius: 4px; font-weight: bold;")
+                self._last_indicator_snapshot = indicator_snapshot
 
             telemetry_rows = []
             for joint_idx in range(1, 7):
@@ -931,31 +1473,64 @@ class DashboardWindow(QMainWindow):
                 telemetry_rows.append(
                     f"Mixed motor cmds: M{wrist['motor_a_id']}={_fmt_rpm(wrist['motor_a_cmd']).strip()} RPM  M{wrist['motor_b_id']}={_fmt_rpm(wrist['motor_b_cmd']).strip()} RPM"
                 )
+            hand = get_hand_dashboard_snapshot()
             telemetry_rows.append("")
-            telemetry_rows.append("Raw:")
-            telemetry_rows.append(backend.last_telemetry_line)
-            self.telemetry_view.setPlainText("\n".join(telemetry_rows))
+            telemetry_rows.append("Hand:")
+            telemetry_rows.append(f"Controller: {hand['controller']}")
+            telemetry_rows.append(f"PWM: {hand['pwm']}")
+
+            telemetry_text = "\n".join(telemetry_rows)
+            if telemetry_text != self._last_telemetry_text:
+                self.telemetry_view.setPlainText(telemetry_text)
+                if hasattr(self, "info_tabs") and self.info_tabs.currentIndex() == self.telemetry_tab_index:
+                    self.telemetry_detail_view.setPlainText(telemetry_text)
+                self._last_telemetry_text = telemetry_text
+
+            # Update wrist visualization widget
+            wrist_snap = get_wrist_dashboard_snapshot()
+            if (
+                wrist_snap
+                and hasattr(self, "wrist_viz_widget")
+                and hasattr(self, "info_tabs")
+                and self.info_tabs.currentIndex() == self.wrist_viz_tab_index
+            ):
+                self.wrist_viz_widget.update_wrist(
+                    pitch_actual=wrist_snap.get("pitch_actual"),
+                    roll_actual=wrist_snap.get("roll_actual"),
+                    pitch_target=wrist_snap.get("pitch_target"),
+                    roll_target=wrist_snap.get("roll_target"),
+                    motor_a_cmd=wrist_snap.get("motor_a_cmd"),
+                    motor_b_cmd=wrist_snap.get("motor_b_cmd"),
+                )
 
             for row, joint_idx in enumerate(range(1, 7)):
                 tgt = float(np.degrees(backend.current_joint_angles[joint_idx])) if joint_idx < len(backend.current_joint_angles) else 0.0
                 cur = backend.get_current_ik_deg_from_apos(joint_idx)
                 err = None if cur is None else abs(cur - tgt)
-                items = [
-                    QTableWidgetItem(f"J{joint_idx}"),
-                    QTableWidgetItem(f"{tgt:7.2f}°"),
-                    QTableWidgetItem("---" if cur is None else f"{cur:7.2f}°"),
-                    QTableWidgetItem("---" if err is None else f"{err:6.2f}°"),
-                ]
-                for col, item in enumerate(items):
-                    item.setTextAlignment(Qt.AlignCenter)
-                    self.joint_table.setItem(row, col, item)
+                row_values = (
+                    f"J{joint_idx}",
+                    f"{tgt:7.2f}°",
+                    "---" if cur is None else f"{cur:7.2f}°",
+                    "---" if err is None else f"{err:6.2f}°",
+                )
+                if self._last_table_values.get(joint_idx) != row_values:
+                    self._last_table_values[joint_idx] = row_values
+                    for col, text in enumerate(row_values):
+                        item = self.joint_table.item(row, col)
+                        if item is None:
+                            item = QTableWidgetItem(text)
+                            item.setTextAlignment(Qt.AlignCenter)
+                            self.joint_table.setItem(row, col, item)
+                        elif item.text() != text:
+                            item.setText(text)
 
             status_snapshot = backend.get_connection_status_text() + "\n" + backend.last_telemetry_line
             if status_snapshot != self._last_status_snapshot:
                 self._append_log("Status updated.")
                 self._last_status_snapshot = status_snapshot
 
-            self.canvas.draw_arm()
+            if draw_canvas:
+                self.canvas.draw_arm()
         finally:
             self._building_controls = False
 

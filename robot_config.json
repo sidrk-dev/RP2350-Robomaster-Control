@@ -1,4 +1,27 @@
 {
+    "controllers": {
+        "base": {
+            "port": "COM7",
+            "motors": [
+                1,
+                2,
+                3
+            ]
+        },
+        "joint4": {
+            "port": "COM15",
+            "motors": [
+                4
+            ]
+        },
+        "wrist": {
+            "port": "COM14",
+            "motors": [
+                5,
+                6
+            ]
+        }
+    },
     "motors": {
         "1": {
             "type": "M3508",
@@ -33,11 +56,11 @@
             "min_angle": -90.0,
             "max_angle": 90.0,
             "zero_offset": 0.0,
-            "ik_zero_offset": 0.0,
             "abs_zero_offset": 199.6,
             "abs_encoder_index": 0,
             "abs_encoder_reversed": false,
-            "abs_pid_enabled": true
+            "abs_pid_enabled": true,
+            "ik_zero_offset": 0.0
         },
         "3": {
             "type": "M3508",
@@ -53,11 +76,11 @@
             "min_angle": -90.0,
             "max_angle": 125.0,
             "zero_offset": 0.0,
-            "ik_zero_offset": 90.0,
             "abs_zero_offset": 106.2,
             "abs_encoder_index": 1,
             "abs_encoder_reversed": false,
-            "abs_pid_enabled": true
+            "abs_pid_enabled": true,
+            "ik_zero_offset": 90.0
         },
         "4": {
             "type": "M2006",
@@ -121,8 +144,8 @@
         "enabled": true,
         "pitch_joint_id": 5,
         "roll_joint_id": 6,
-        "pitch_encoder_index": null,
-        "roll_encoder_index": null,
+        "pitch_encoder_index": 0,
+        "roll_encoder_index": 1,
         "pitch_encoder_motor_id": 5,
         "roll_encoder_motor_id": 6,
         "motor_a_id": 5,

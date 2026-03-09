@@ -13,9 +13,9 @@ except ImportError:
 
 # Configuration
 BAUD_RATE = 115200
-MOTOR_1_ID = 2
-MOTOR_2_ID = 3
-SPEED = 100
+MOTOR_1_ID = 5
+MOTOR_2_ID = 6
+SPEED = 50
 
 ser = None
 

@@ -14,7 +14,7 @@ except ImportError:
 # Configuration
 BAUD_RATE = 115200
 MOTOR_ID = 3
-SPEED = 100
+SPEED = 50
 
 ser = None
 forward_pressed = False
@@ -50,6 +50,9 @@ def on_press(key):
                 reverse_pressed = True
                 print(f"Spinning Motor {MOTOR_ID} Reverse...")
                 send_command(f"M {MOTOR_ID} {-SPEED}")
+            elif char == 'b':
+                print("Sending BLINK command...")
+                send_command("BLINK")
             elif char == 'q':
                 print("Quitting...")
                 return False # Stop listener
@@ -91,6 +94,7 @@ def main():
     global ser
     print("Looking for Arduino serial port...")
     port_name = find_serial_port()
+    port_name = "COM7"
     
     if not port_name:
         print("No serial ports found! Please plug in your device.")
@@ -108,6 +112,7 @@ def main():
     print("\n--- Controls ---")
     print("Hold 'W' to spin forward")
     print("Hold 'S' to spin backward")
+    print("Press 'B' to blink the Pico LED for 5 seconds")
     print("Press 'Q' to quit")
     print("----------------\n")
 

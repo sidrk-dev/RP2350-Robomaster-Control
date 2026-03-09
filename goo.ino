@@ -17,6 +17,8 @@
 #define CS_PIN 1  // D7  / GPIO1 (SPI0_CSn)
 #define SCK_PIN 2 // D8  / GPIO2 (SPI0_SCK)
 #define TX_PIN 3  // D10 / GPIO3 (SPI0_MOSI)
+#define HAND_DIR_PIN D5
+#define HAND_PWM_PIN D6
 
 // -------------------- ABSOLUTE ENCODER (AMT203S on SPI1) --------------------
 #define ENC_SCK_PIN D0  // GPIO26 -> SPI1 SCK
@@ -82,6 +84,10 @@ struct {
 
 struct can_frame sendMsg[2] = {};
 struct can_frame readMsg = {};
+int handPwmCommand = 0;
+uint32_t blinkActiveUntilMs = 0;
+uint32_t blinkLastToggleMs = 0;
+bool blinkLedState = false;
 
 // -------------------- PROTOTYPES --------------------
 void SPIinit();
@@ -98,6 +104,7 @@ void processCommand(String line);
 int16_t readAbsEncoder(uint8_t encoderIndex);
 uint8_t SPIWriteToEncoder(uint8_t encoderIndex, uint8_t sendByte);
 void updateAbsEncoders();
+void startBlinkLed();
 static float getControlTotalAngle(uint8_t motorIndex);
 static float getControlLogicalAngle(uint8_t motorIndex);
 static bool isJointFullRange(uint8_t motorIndex);
@@ -107,11 +114,14 @@ static float projectLogicalTargetToLimits(uint8_t motorIndex, float targetDeg,
 static void clampActiveAngleTargetToLimits(uint8_t motorIndex);
 static void fallbackMotorToInternalEncoder(uint8_t motorIndex);
 static void resetAbsStateForMotor(uint8_t motorIndex);
+void setHandPwm(int pwmCommand);
 
 // -------------------- SETUP --------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   SPIinit();
   SPI1init();
@@ -162,6 +172,10 @@ void setup() {
   sendMsg[1].can_dlc = 8;
 
   pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(HAND_DIR_PIN, OUTPUT);
+  pinMode(HAND_PWM_PIN, OUTPUT);
+  analogWrite(HAND_PWM_PIN, 0);
+  digitalWrite(HAND_DIR_PIN, LOW);
 
   printHelp();
 }
@@ -233,7 +247,18 @@ void loop() {
     if (motor[i].mode == MODE::ANGLE)
       anyAngleMode = true;
   }
-  digitalWrite(LED_BUILTIN, anyAngleMode ? HIGH : LOW);
+  uint32_t nowMs = millis();
+  if (blinkActiveUntilMs > nowMs) {
+    if ((nowMs - blinkLastToggleMs) >= 200) {
+      blinkLastToggleMs = nowMs;
+      blinkLedState = !blinkLedState;
+      digitalWrite(LED_BUILTIN, blinkLedState ? HIGH : LOW);
+    }
+  } else {
+    blinkActiveUntilMs = 0;
+    blinkLedState = false;
+    digitalWrite(LED_BUILTIN, anyAngleMode ? HIGH : LOW);
+  }
 }
 
 // -------------------- SERIAL COMMANDS --------------------
@@ -292,8 +317,13 @@ void printHelp() {
       "  ENCMAP <enc> <motor> : Map encoder index to motor ID (0=unmap)");
   Serial.println(
       "  ABSPID <id|*> <0|1>  : Use mapped abs encoder for PID (safe sync)");
+  Serial.println("  HOPEN [0-255]       : Open hand with PWM (default 255)");
+  Serial.println("  HCLOSE [0-255]      : Close hand with PWM (default 255)");
+  Serial.println("  HSTOP               : Stop hand PWM");
+  Serial.println("  HAND <-255..255>    : Signed hand PWM (+open, -close)");
   Serial.println("  ENCZERO <enc>       : Set encoder zero point");
   Serial.println("  ENCREV <enc>        : Toggle encoder direction");
+  Serial.println("  BLINK               : Blink onboard LED for 5 seconds");
   Serial.println("");
   Serial.println("S : Stop ALL motors");
   Serial.println("H : Help");
@@ -440,6 +470,30 @@ static void resetAbsStateForMotor(uint8_t motorIndex) {
   motor[motorIndex].useAbsEncoderForPID = false;
 }
 
+void setHandPwm(int pwmCommand) {
+  if (pwmCommand > 255)
+    pwmCommand = 255;
+  if (pwmCommand < -255)
+    pwmCommand = -255;
+  handPwmCommand = pwmCommand;
+  if (pwmCommand > 0) {
+    digitalWrite(HAND_DIR_PIN, HIGH);
+    analogWrite(HAND_PWM_PIN, pwmCommand);
+  } else if (pwmCommand < 0) {
+    digitalWrite(HAND_DIR_PIN, LOW);
+    analogWrite(HAND_PWM_PIN, -pwmCommand);
+  } else {
+    analogWrite(HAND_PWM_PIN, 0);
+  }
+}
+
+void startBlinkLed() {
+  blinkActiveUntilMs = millis() + 5000;
+  blinkLastToggleMs = 0;
+  blinkLedState = false;
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
 static void dispatchMotorIDs(String idStr, bool &isWildcard, int &singleId) {
   if (idStr == "*") {
     isWildcard = true;
@@ -454,6 +508,58 @@ void processCommand(String line) {
   // Command: HELP
   if (line == "H") {
     printHelp();
+    return;
+  }
+
+  if (line == "BLINK") {
+    startBlinkLed();
+    Serial.println("BLINK STARTED");
+    return;
+  }
+
+  if (line == "HOPEN") {
+    setHandPwm(255);
+    Serial.println("HAND OPEN PWM 255");
+    return;
+  }
+
+  if (line == "HCLOSE") {
+    setHandPwm(-255);
+    Serial.println("HAND CLOSE PWM 255");
+    return;
+  }
+
+  if (line == "HSTOP") {
+    setHandPwm(0);
+    Serial.println("HAND STOP");
+    return;
+  }
+
+  if (line.startsWith("HOPEN ")) {
+    int pwm = line.substring(6).toInt();
+    if (pwm < 0)
+      pwm = -pwm;
+    setHandPwm(pwm);
+    Serial.print("HAND OPEN PWM ");
+    Serial.println(abs(handPwmCommand));
+    return;
+  }
+
+  if (line.startsWith("HCLOSE ")) {
+    int pwm = line.substring(7).toInt();
+    if (pwm < 0)
+      pwm = -pwm;
+    setHandPwm(-pwm);
+    Serial.print("HAND CLOSE PWM ");
+    Serial.println(abs(handPwmCommand));
+    return;
+  }
+
+  if (line.startsWith("HAND ")) {
+    int pwm = line.substring(5).toInt();
+    setHandPwm(pwm);
+    Serial.print("HAND PWM ");
+    Serial.println(handPwmCommand);
     return;
   }
 

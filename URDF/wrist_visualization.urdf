@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<robot name="wrist_visualization">
+  <link name="base_link" />
+
+  <joint name="pitch_joint" type="revolute">
+    <parent link="base_link" />
+    <child link="pitch_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1" velocity="1" />
+  </joint>
+
+  <link name="pitch_link" />
+
+  <joint name="roll_joint" type="revolute">
+    <parent link="pitch_link" />
+    <child link="tool_link" />
+    <origin xyz="0 0 0.16" rpy="0 0 0" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.5708" upper="1.5708" effort="1" velocity="1" />
+  </joint>
+
+  <link name="tool_link" />
+</robot>

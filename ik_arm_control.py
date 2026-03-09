@@ -17,6 +17,7 @@ import queue
 CONFIG_FILE = "robot_config.json"
 robot_config = {}
 wrist_diff_config = {}
+controller_config = {}
 
 try:
     from ikpy.chain import Chain
@@ -49,6 +50,12 @@ tx_thread = None
 wrist_diff_thread = None
 serial_running = True
 cmd_queue = queue.Queue()
+controller_ports = {"base": None, "joint4": None, "wrist": None}
+controller_serial = {"base": None, "joint4": None, "wrist": None}
+controller_read_threads = {"base": None, "joint4": None, "wrist": None}
+controller_tx_threads = {"base": None, "joint4": None, "wrist": None}
+controller_cmd_queues = {"base": queue.Queue(), "joint4": queue.Queue(), "wrist": queue.Queue()}
+controller_last_telemetry_line = {"base": "", "joint4": "", "wrist": ""}
 my_chain = None
 current_target_xyz = [0.2, 0.0, 0.3]  # Default safe position
 current_target_rpy = [0.0, 0.0, 0.0]  # Roll, Pitch, Yaw
@@ -113,10 +120,17 @@ wrist_diff_pid_state = {
 }
 wrist_diff_last_update_time = 0.0
 wrist_diff_last_motor_cmd = (None, None)
+hand_pwm_command = 0
 
 TELEMETRY_STALE_SEC = 1.0
 AUTO_MOVE_TO_ZERO_ON_CONNECT = True
 AUTO_MOVE_TO_ZERO_WAIT_SEC = 1.5
+CONTROLLER_MOTOR_GROUPS = {
+    "base": {1, 2, 3},
+    "joint4": {4},
+    "wrist": {5, 6},
+}
+BROADCAST_COMMANDS = {"S", "TON", "TOFF", "T"}
 
 
 def _safe_float(v):
@@ -131,6 +145,190 @@ def _get_zero_offset(mid):
         return float(robot_config.get(str(mid), {}).get("zero_offset", 0.0))
     except Exception:
         return 0.0
+
+
+def _get_controller_defaults():
+    return {
+        "base": {"port": None, "motors": [1, 2, 3]},
+        "joint4": {"port": None, "motors": [4]},
+        "wrist": {"port": None, "motors": [5, 6]},
+    }
+
+
+def _normalize_controller_config(raw_cfg):
+    merged = _get_controller_defaults()
+    if not isinstance(raw_cfg, dict):
+        return merged
+    for name in ("base", "joint4", "wrist"):
+        cfg = raw_cfg.get(name, {}) if isinstance(raw_cfg.get(name, {}), dict) else {}
+        if cfg.get("port") not in (None, ""):
+            merged[name]["port"] = str(cfg.get("port"))
+        motors = cfg.get("motors")
+        if isinstance(motors, list):
+            out = []
+            for mid in motors:
+                try:
+                    out.append(int(mid))
+                except Exception:
+                    pass
+            if out:
+                merged[name]["motors"] = out
+    return merged
+
+
+def _controller_for_motor(mid):
+    try:
+        motor_id = int(mid)
+    except Exception:
+        return "base"
+    active_groups = CONTROLLER_MOTOR_GROUPS
+    if controller_config:
+        active_groups = {
+            name: set(cfg.get("motors", []))
+            for name, cfg in controller_config.items()
+        }
+    for controller_name, motor_ids in active_groups.items():
+        if motor_id in motor_ids:
+            return controller_name
+    return "base"
+
+
+def _connected_controller_names():
+    return [name for name, conn in controller_serial.items() if conn and conn.is_open]
+
+
+def _get_primary_serial():
+    for name in ("base", "joint4", "wrist"):
+        conn = controller_serial.get(name)
+        if conn and conn.is_open:
+            return conn
+    return None
+
+
+def _sync_legacy_serial_refs():
+    global ser, read_thread, tx_thread, cmd_queue, last_telemetry_line
+    ser = _get_primary_serial()
+    read_thread = controller_read_threads.get("base") or controller_read_threads.get("joint4") or controller_read_threads.get("wrist")
+    tx_thread = controller_tx_threads.get("base") or controller_tx_threads.get("joint4") or controller_tx_threads.get("wrist")
+    cmd_queue = controller_cmd_queues["base"]
+    last_telemetry_line = controller_last_telemetry_line.get("base") or controller_last_telemetry_line.get("joint4") or controller_last_telemetry_line.get("wrist") or ""
+
+
+def _connected_controller_count():
+    return len(_connected_controller_names())
+
+
+def _parse_command_segments(cmd):
+    return [part.strip() for part in str(cmd).split(";") if part.strip()]
+
+
+def _route_segment(segment):
+    toks = segment.split()
+    if not toks:
+        return set()
+    op = toks[0].upper()
+    if op in BROADCAST_COMMANDS:
+        return set(CONTROLLER_MOTOR_GROUPS.keys())
+    if op in {"P", "PR", "M", "MV", "KP", "KI", "KD", "AOL", "SKP", "SKI", "SKD", "SOL", "ABSPID", "CAL", "JLIM"}:
+        if len(toks) >= 2:
+            return {_controller_for_motor(toks[1])}
+    if op == "ENCMAP":
+        if len(toks) >= 3:
+            target_motor = toks[2]
+            if str(target_motor) == "0":
+                return set(CONTROLLER_MOTOR_GROUPS.keys())
+            return {_controller_for_motor(target_motor)}
+        return set(CONTROLLER_MOTOR_GROUPS.keys())
+    if op in {"HAND", "HOPEN", "HCLOSE", "HSTOP"}:
+        return {"wrist"}
+    return set(CONTROLLER_MOTOR_GROUPS.keys())
+
+
+def _route_command_packets(cmd):
+    routed = {name: [] for name in CONTROLLER_MOTOR_GROUPS}
+    for segment in _parse_command_segments(cmd):
+        destinations = _route_segment(segment)
+        for controller_name in destinations:
+            routed[controller_name].append(segment)
+    return {name: "; ".join(parts) for name, parts in routed.items() if parts}
+
+
+def _clear_pending_commands(controller_name=None):
+    queue_names = [controller_name] if controller_name else list(controller_cmd_queues.keys())
+    for name in queue_names:
+        q = controller_cmd_queues[name]
+        while not q.empty():
+            try:
+                q.get_nowait()
+                q.task_done()
+            except Exception:
+                break
+
+
+def set_hand_pwm(pwm_value):
+    global hand_pwm_command
+    try:
+        pwm = int(round(float(pwm_value)))
+    except Exception:
+        pwm = 0
+    pwm = max(-255, min(255, pwm))
+    hand_pwm_command = pwm
+    send_command(f"HAND {pwm}")
+    print(f"Hand PWM command: {pwm}")
+    return pwm
+
+
+def open_hand(pwm_value=255):
+    return set_hand_pwm(abs(pwm_value))
+
+
+def close_hand(pwm_value=255):
+    return set_hand_pwm(-abs(pwm_value))
+
+
+def stop_hand():
+    return set_hand_pwm(0)
+
+
+def find_serial_ports():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        return []
+    preferred = []
+    fallback = []
+    for port in ports:
+        desc = f"{port.description} {port.device}".lower()
+        if any(token in desc for token in ("ch340", "arduino", "serial", "usb")):
+            preferred.append(port.device)
+        else:
+            fallback.append(port.device)
+    ordered = preferred + fallback
+    seen = []
+    for device in ordered:
+        if device not in seen:
+            seen.append(device)
+    return seen
+
+
+def _ordered_controller_ports():
+    available = find_serial_ports()
+    ordered = []
+    used = set()
+    for name in ("base", "joint4", "wrist"):
+        preferred = None
+        if isinstance(controller_config.get(name, {}), dict):
+            preferred = controller_config[name].get("port")
+        if preferred and preferred in available and preferred not in used:
+            ordered.append((name, preferred))
+            used.add(preferred)
+    remaining = [port for port in available if port not in used]
+    for name in ("base", "joint4", "wrist"):
+        if any(existing_name == name for existing_name, _ in ordered):
+            continue
+        if not remaining:
+            break
+        ordered.append((name, remaining.pop(0)))
+    return ordered
 
 
 def _get_wrist_diff_defaults():
@@ -234,13 +432,44 @@ def set_wrist_diff_targets(pitch_target_deg=None, roll_target_deg=None):
     reset_wrist_diff_pid_state()
 
 
+def get_wrist_motor_logical_deg():
+    cfg = get_wrist_diff_config()
+    motor_a_id = int(cfg.get("motor_a_id", 5))
+    motor_b_id = int(cfg.get("motor_b_id", 6))
+    motor_a_apos = latest_motor_apos_deg.get(motor_a_id)
+    motor_b_apos = latest_motor_apos_deg.get(motor_b_id)
+    if motor_a_apos is None or motor_b_apos is None:
+        return None, None
+    motor_a_logical = float(motor_a_apos) - _get_abs_zero_offset(motor_a_id)
+    motor_b_logical = float(motor_b_apos) - _get_abs_zero_offset(motor_b_id)
+    return motor_a_logical, motor_b_logical
+
+
+def get_wrist_diff_actual_axes_deg():
+    cfg = get_wrist_diff_config()
+    mix = cfg.get("mix", {})
+    motor_a_logical, motor_b_logical = get_wrist_motor_logical_deg()
+    if motor_a_logical is None or motor_b_logical is None:
+        return None, None
+
+    a11 = float(mix.get("motor_a_pitch_sign", 1.0))
+    a12 = float(mix.get("motor_a_roll_sign", 1.0))
+    a21 = float(mix.get("motor_b_pitch_sign", 1.0))
+    a22 = float(mix.get("motor_b_roll_sign", -1.0))
+    det = (a11 * a22) - (a12 * a21)
+    if abs(det) < 1e-6:
+        return None, None
+
+    pitch_actual = ((motor_a_logical * a22) - (a12 * motor_b_logical)) / det
+    roll_actual = ((a11 * motor_b_logical) - (motor_a_logical * a21)) / det
+    return float(pitch_actual), float(roll_actual)
+
+
 def get_wrist_output_logical_deg(axis_name):
-    motor_id = wrist_diff_encoder_motor_id(axis_name)
-    apos = latest_motor_apos_deg.get(int(motor_id))
-    if apos is None:
-        return None
-    joint_id = wrist_diff_joint_id_for_axis(axis_name)
-    return float(apos) - _get_abs_zero_offset(joint_id)
+    pitch_actual, roll_actual = get_wrist_diff_actual_axes_deg()
+    if axis_name == "pitch":
+        return pitch_actual
+    return roll_actual
 
 
 def _get_abs_zero_offset(mid):
@@ -338,6 +567,9 @@ def get_start_command_position(mid, target_deg):
     prev = last_sent_logical_deg.get(mid)
     if prev is not None and (time.time() - last_command_wall_time) < RECENT_COMMAND_HOLD_SEC:
         return prev
+    logical_now = get_current_logical_deg_from_apos(mid)
+    if logical_now is not None:
+        return logical_now
     tele = latest_motor_pos_deg.get(mid)
     if tele is not None:
         return tele
@@ -374,9 +606,10 @@ def command_distance_deg(mid, a_deg, b_deg):
 
 
 def load_robot_config():
-    global robot_config, wrist_diff_config
+    global robot_config, wrist_diff_config, controller_config
     robot_config = {}
     wrist_diff_config = {}
+    controller_config = _get_controller_defaults()
     if not os.path.exists(CONFIG_FILE):
         return
     try:
@@ -388,6 +621,7 @@ def load_robot_config():
         diff_cfg = data.get("wrist_differential", {}) if isinstance(data, dict) else {}
         if isinstance(diff_cfg, dict):
             wrist_diff_config = diff_cfg
+        controller_config = _normalize_controller_config(data.get("controllers", {}))
     except Exception as e:
         print(f"Warning: Failed to load {CONFIG_FILE}: {e}")
 
@@ -526,8 +760,7 @@ def update_wrist_diff_controller_once():
     roll_target = wrist_diff_target_logical_deg.get("roll")
     if pitch_target is None and roll_target is None:
         return False
-    pitch_actual = get_wrist_output_logical_deg("pitch")
-    roll_actual = get_wrist_output_logical_deg("roll")
+    pitch_actual, roll_actual = get_wrist_diff_actual_axes_deg()
     if pitch_actual is None or roll_actual is None:
         return False
 
@@ -749,41 +982,48 @@ def sync_target_from_joint_angles(joint_angles):
 
 # --- Serial Functions ---
 def find_serial_port():
-    ports = serial.tools.list_ports.comports()
-    if not ports:
-        return None
-    for port in ports:
-        if "CH340" in port.description or "Arduino" in port.description or "Serial" in port.description:
-            return port.device
-    return ports[0].device
+    ports = find_serial_ports()
+    return ports[0] if ports else None
+
+
+def _connect_single_controller(controller_name, port_name):
+    conn = serial.Serial(port_name, BAUD_RATE, timeout=0.1)
+    time.sleep(2)
+    controller_ports[controller_name] = port_name
+    controller_serial[controller_name] = conn
+    reader = threading.Thread(target=read_from_port, args=(controller_name,), daemon=True)
+    controller_read_threads[controller_name] = reader
+    reader.start()
+    tx = controller_tx_threads.get(controller_name)
+    if tx is None or not tx.is_alive():
+        tx = threading.Thread(target=command_tx_loop, args=(controller_name,), daemon=True)
+        controller_tx_threads[controller_name] = tx
+        tx.start()
+    return conn
 
 def connect_serial():
-    global ser, read_thread, tx_thread, wrist_diff_thread, last_command_wall_time
-    if ser and ser.is_open:
+    global wrist_diff_thread, last_command_wall_time
+    if _connected_controller_count() > 0:
+        _sync_legacy_serial_refs()
         update_connection_button()
         return True
-    print("Looking for Arduino serial port...")
-    port_name = find_serial_port()
-    if not port_name:
+    print("Looking for controller serial ports...")
+    assignments = _ordered_controller_ports()
+    if not assignments:
         print("No serial ports found! Please plug in your device.")
         update_connection_button()
         return False
 
-    print(f"Connecting to {port_name}...")
     try:
-        ser = serial.Serial(port_name, BAUD_RATE, timeout=0.1)
-        time.sleep(2) # Wait for reset
-        print("Connected successfully!")
+        for controller_name, port_name in assignments:
+            print(f"Connecting {controller_name} controller to {port_name}...")
+            _connect_single_controller(controller_name, port_name)
+        _sync_legacy_serial_refs()
+        print(f"Connected controllers: {', '.join(f'{name}={controller_ports[name]}' for name, _ in assignments)}")
 
         latest_motor_pos_deg.clear()
         latest_motor_apos_deg.clear()
         latest_motor_telemetry_time.clear()
-
-        read_thread = threading.Thread(target=read_from_port, daemon=True)
-        read_thread.start()
-        if tx_thread is None or not tx_thread.is_alive():
-            tx_thread = threading.Thread(target=command_tx_loop, daemon=True)
-            tx_thread.start()
         if wrist_diff_thread is None or not wrist_diff_thread.is_alive():
             wrist_diff_thread = threading.Thread(target=wrist_diff_control_loop, daemon=True)
             wrist_diff_thread.start()
@@ -800,29 +1040,35 @@ def connect_serial():
         update_connection_button()
         return True
     except Exception as e:
-        print(f"Failed to connect to {port_name}: {e}")
+        print(f"Failed to connect controllers: {e}")
+        disconnect_serial()
         update_connection_button()
         return False
 
 def disconnect_serial():
-    global ser, read_thread
-    if ser and ser.is_open:
-        try:
-            clear_wrist_diff_targets(send_stop=True)
-            ser.close()
-        except Exception:
-            pass
-    ser = None
-    read_thread = None
+    global ser, read_thread, tx_thread, last_telemetry_line, hand_pwm_command
+    clear_wrist_diff_targets(send_stop=True)
+    send_command("HSTOP")
+    hand_pwm_command = 0
+    for controller_name, conn in list(controller_serial.items()):
+        if conn and conn.is_open:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        controller_serial[controller_name] = None
+        controller_ports[controller_name] = None
+        controller_read_threads[controller_name] = None
+        controller_tx_threads[controller_name] = None
+        controller_last_telemetry_line[controller_name] = ""
     latest_motor_pos_deg.clear()
     latest_motor_apos_deg.clear()
     latest_motor_telemetry_time.clear()
-    while not cmd_queue.empty():
-        try:
-            cmd_queue.get_nowait()
-            cmd_queue.task_done()
-        except Exception:
-            break
+    _clear_pending_commands()
+    ser = None
+    read_thread = None
+    tx_thread = None
+    last_telemetry_line = ""
     update_connection_button()
     return True
 
@@ -831,13 +1077,13 @@ def update_connection_button():
     global btn_connection
     if btn_connection is None:
         return
-    connected = bool(ser and ser.is_open)
+    connected = _connected_controller_count() > 0
     tele_ok = has_fresh_telemetry()
     if connected and tele_ok:
-        label = 'Connected'
+        label = f'Connected ({_connected_controller_count()})'
         color = 'lightgreen'
     elif connected:
-        label = 'Port Open'
+        label = f'Port Open ({_connected_controller_count()})'
         color = 'khaki'
     else:
         label = 'Disconnected'
@@ -861,7 +1107,7 @@ def has_fresh_telemetry():
 
 
 def get_connection_status_text():
-    connected = bool(ser and ser.is_open)
+    connected = _connected_controller_count() > 0
     tele_ok = has_fresh_telemetry()
     now = time.time()
     if last_serial_command_time > 0:
@@ -877,10 +1123,16 @@ def get_connection_status_text():
     last_cmd = last_serial_command if last_serial_command else "<none>"
     if len(last_cmd) > 58:
         last_cmd = last_cmd[:55] + "..."
+    port_parts = []
+    for name in ("base", "joint4", "wrist"):
+        port_name = controller_ports.get(name)
+        if port_name:
+            port_parts.append(f"{name}:{port_name}")
     return (
         "Link Status\n"
-        f"Port:      {'OPEN' if connected else 'CLOSED'}\n"
+        f"Ports:     {', '.join(port_parts) if port_parts else 'CLOSED'}\n"
         f"Telemetry: {'LIVE' if tele_ok else 'STALE'} ({tele_age_str})\n"
+        f"Hand PWM:  {hand_pwm_command}\n"
         f"Sent Cmds: {serial_command_count}\n"
         f"Last Send: {cmd_age_str}\n"
         f"Last Cmd:  {last_cmd}"
@@ -914,7 +1166,7 @@ def get_auto_zero_motor_ids():
 def move_configured_joints_to_zero_on_connect():
     if not AUTO_MOVE_TO_ZERO_ON_CONNECT:
         return False
-    if not (ser and ser.is_open):
+    if _connected_controller_count() == 0:
         return False
     motor_ids = get_auto_zero_motor_ids()
     wrist_active = wrist_diff_enabled()
@@ -970,7 +1222,7 @@ def move_configured_joints_to_zero_on_connect():
     return True
 
 def toggle_connection_callback(event):
-    if ser and ser.is_open:
+    if _connected_controller_count() > 0:
         disconnect_serial()
         print("Disconnected from serial device.")
     else:
@@ -980,21 +1232,20 @@ def toggle_connection_callback(event):
             print("Serial connection failed.")
     render_plot()
 
-def read_from_port():
-    global latest_motor_pos_deg, latest_motor_apos_deg, latest_motor_telemetry_time, last_telemetry_line, actual_joint_angles
-    import re
+def read_from_port(controller_name):
+    global latest_motor_pos_deg, latest_motor_apos_deg, latest_motor_telemetry_time, last_telemetry_line
     motor_re = re.compile(r"M(\d+)")
     pos_re = re.compile(r"POS:([^\s|]+)")
     apos_re = re.compile(r"APOS:([^\s|]+)")
-    while ser and ser.is_open:
+    conn = controller_serial.get(controller_name)
+    while conn and conn.is_open:
         try:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if conn.in_waiting > 0:
+                line = conn.readline().decode('utf-8', errors='ignore').strip()
                 if line:
+                    controller_last_telemetry_line[controller_name] = line
                     last_telemetry_line = line
-                    print(f"[Arduino] {line}")
-                    # Parse telemetry from multi-motor lines:
-                    # M1 POS:.. | M2 POS:.. |
+                    print(f"[{controller_name}] {line}")
                     for token in line.split("|"):
                         token = token.strip()
                         if not token.startswith("M"):
@@ -1020,7 +1271,7 @@ def read_from_port():
                             pass
             time.sleep(0.01)
         except (serial.SerialException, OSError) as e:
-            print(f"Serial read error: {e}")
+            print(f"Serial read error ({controller_name}): {e}")
             break
         except Exception:
             break
@@ -1035,42 +1286,41 @@ def _is_motion_command(cmd):
     return False
 
 
-def _clear_pending_commands():
-    while not cmd_queue.empty():
-        try:
-            cmd_queue.get_nowait()
-            cmd_queue.task_done()
-        except Exception:
-            break
-
-
-def command_tx_loop():
+def command_tx_loop(controller_name):
     while serial_running:
         try:
-            cmd = cmd_queue.get(timeout=0.1)
+            cmd = controller_cmd_queues[controller_name].get(timeout=0.1)
         except queue.Empty:
             continue
         try:
-            if ser and ser.is_open:
-                ser.write((cmd + '\n').encode('utf-8'))
+            conn = controller_serial.get(controller_name)
+            if conn and conn.is_open:
+                conn.write((cmd + '\n').encode('utf-8'))
                 time.sleep(0.015)
         except Exception as e:
-            print(f"Error sending command: {e}")
+            print(f"Error sending command ({controller_name}): {e}")
         finally:
-            cmd_queue.task_done()
+            controller_cmd_queues[controller_name].task_done()
 
 
 def send_command(cmd):
     global last_serial_command, last_serial_command_time, serial_command_count
-    if ser and ser.is_open:
+    if _connected_controller_count() > 0:
         try:
             if _is_motion_command(cmd):
                 _clear_pending_commands()
-            cmd_queue.put(cmd)
+            routed_packets = _route_command_packets(cmd)
+            if not routed_packets:
+                print(f"[TX SKIPPED] No controller route for: {cmd}")
+                return
+            for controller_name, packet in routed_packets.items():
+                conn = controller_serial.get(controller_name)
+                if conn and conn.is_open:
+                    controller_cmd_queues[controller_name].put(packet)
+                    print(f"[TX QUEUED:{controller_name}] {packet}")
             last_serial_command = cmd
             last_serial_command_time = time.time()
             serial_command_count += 1
-            print(f"[TX QUEUED] {cmd}")
         except Exception as e:
             print(f"Error sending command: {e}")
     else:
@@ -1640,10 +1890,25 @@ def set_current_pose_as_motor_and_ik_zero(event):
     render_plot()
 
 def emergency_stop_callback(event):
+    global hand_pwm_command
     print("EMERGENCY STOP TRIGGERED!")
     for mid in last_sent_logical_deg:
         last_sent_logical_deg[mid] = None
+    hand_pwm_command = 0
     send_command("S")
+    send_command("HSTOP")
+
+
+def hand_open_button_callback(event):
+    open_hand(255)
+
+
+def hand_close_button_callback(event):
+    close_hand(255)
+
+
+def hand_stop_button_callback(event):
+    stop_hand()
 
 def main():
     global my_chain, fig, ax, ax_top, ax_side
@@ -1776,19 +2041,31 @@ def main():
     btn_prev = Button(ax_prev_btn, 'Preview (Plan)', color='lightblue', hovercolor='0.9')
     btn_prev.on_clicked(preview_button_callback)
 
-    ax_live = plt.axes([0.66, 0.19, 0.28, 0.05])
+    ax_hand_open = plt.axes([0.66, 0.19, 0.14, 0.045])
+    btn_hand_open = Button(ax_hand_open, 'Hand Open', color='palegreen', hovercolor='0.9')
+    btn_hand_open.on_clicked(hand_open_button_callback)
+
+    ax_hand_close = plt.axes([0.82, 0.19, 0.12, 0.045])
+    btn_hand_close = Button(ax_hand_close, 'Hand Close', color='mistyrose', hovercolor='0.9')
+    btn_hand_close.on_clicked(hand_close_button_callback)
+
+    ax_live = plt.axes([0.66, 0.145, 0.28, 0.04])
     chk_live = CheckButtons(ax_live, ['Live Execute'], [live_update])
     chk_live.on_clicked(toggle_live_update)
 
-    ax_sync = plt.axes([0.66, 0.13, 0.28, 0.05])
+    ax_sync = plt.axes([0.66, 0.10, 0.28, 0.04])
     chk_sync = CheckButtons(ax_sync, ['Sync Model to Telemetry'], [sync_model_to_telemetry])
     chk_sync.on_clicked(toggle_sync_model_to_telemetry)
 
-    ax_capture = plt.axes([0.66, 0.07, 0.28, 0.045])
+    ax_hand_stop = plt.axes([0.66, 0.055, 0.28, 0.035])
+    btn_hand_stop = Button(ax_hand_stop, 'Hand Stop', color='lightyellow', hovercolor='0.9')
+    btn_hand_stop.on_clicked(hand_stop_button_callback)
+
+    ax_capture = plt.axes([0.66, 0.015, 0.28, 0.035])
     btn_capture = Button(ax_capture, 'Set Current Pose as Motor+IK Zero', color='khaki', hovercolor='0.9')
     btn_capture.on_clicked(set_current_pose_as_motor_and_ik_zero)
 
-    ax_stop = plt.axes([0.66, 0.015, 0.28, 0.05])
+    ax_stop = plt.axes([0.01, 0.015, 0.16, 0.05])
     btn_stop = Button(ax_stop, 'EMERGENCY STOP', color='salmon', hovercolor='red')
     btn_stop.label.set_fontweight('bold')
     btn_stop.on_clicked(emergency_stop_callback)
@@ -1799,6 +2076,7 @@ def main():
     print("Click 'Preview (Plan)' to simulate the arm moving from current state to the goal state.")
     print("Click 'Execute' to send the goal angles to the hardware and update the current state.")
     print("Click 'EMERGENCY STOP' to immediately stop all motors.")
+    print("Use 'Hand Open', 'Hand Close', and 'Hand Stop' to control the PWM gripper.")
     print("Tick 'Live Execute' to automatically execute immediately when moving.")
     print("Tick 'Sync Model to Telemetry' to make only the ghost arm follow the real arm.")
     print("Click 'Set Current Pose as Motor+IK Zero' to make the current physical pose zero for both motor control and IK.")

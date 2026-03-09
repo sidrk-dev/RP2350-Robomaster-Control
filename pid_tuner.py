@@ -80,6 +80,23 @@ SAFE_PID_PRESETS = {
     },
 }
 
+
+def invert_wrist_mix(motor_a_val, motor_b_val, mix_cfg):
+    a11 = float(mix_cfg.get("motor_a_pitch_sign", 1.0))
+    a12 = float(mix_cfg.get("motor_a_roll_sign", 1.0))
+    a21 = float(mix_cfg.get("motor_b_pitch_sign", 1.0))
+    a22 = float(mix_cfg.get("motor_b_roll_sign", -1.0))
+    det = (a11 * a22) - (a12 * a21)
+    if abs(det) < 1e-6:
+        return None, None
+    pitch = ((float(motor_a_val) * a22) - (a12 * float(motor_b_val))) / det
+    roll = ((a11 * float(motor_b_val)) - (float(motor_a_val) * a21)) / det
+    return float(pitch), float(roll)
+
+
+def clampf(value, min_value, max_value):
+    return max(min_value, min(max_value, value))
+
 class MotorTab:
     def __init__(self, parent, motor_id, config_data, send_cmd_func):
         self.motor_id = motor_id
@@ -119,6 +136,7 @@ class MotorTab:
         ttk.Label(lf_telemetry, text="Velocity:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="e", padx=5)
         self.lbl_current_rpm = ttk.Label(lf_telemetry, text="--- RPM", foreground="green", font=("Arial", 10, "bold"))
         self.lbl_current_rpm.grid(row=1, column=1, sticky="w")
+
         ttk.Label(lf_telemetry, text="Abs Pos (Enc):", font=("Arial", 10, "bold")).grid(row=1, column=2, sticky="e", padx=(20, 5))
         self.lbl_abs_pos = ttk.Label(lf_telemetry, text="---", foreground="orange", font=("Arial", 10, "bold"))
         self.lbl_abs_pos.grid(row=1, column=3, sticky="w")
@@ -676,6 +694,31 @@ class WristTuningTab:
         self.lbl_motor_b = ttk.Label(tele, text="---")
         self.lbl_motor_b.grid(row=2, column=3, sticky="w")
 
+        ctrl = ttk.LabelFrame(self.frame, text="Wrist Differential Target Control", padding=10)
+        ctrl.pack(fill="x", pady=5)
+
+        self.var_pitch_target = tk.DoubleVar(value=0.0)
+        self.var_roll_target = tk.DoubleVar(value=0.0)
+        self.var_step = tk.DoubleVar(value=5.0)
+
+        ttk.Label(ctrl, text="Pitch Target (deg)").grid(row=0, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(ctrl, textvariable=self.var_pitch_target, width=10).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Button(ctrl, text="Set Pitch", command=self.set_pitch_target).grid(row=0, column=2, padx=4, pady=3)
+        ttk.Button(ctrl, text="Pitch -", command=lambda: self.nudge_pitch(-1.0)).grid(row=0, column=3, padx=4, pady=3)
+        ttk.Button(ctrl, text="Pitch +", command=lambda: self.nudge_pitch(1.0)).grid(row=0, column=4, padx=4, pady=3)
+
+        ttk.Label(ctrl, text="Roll Target (deg)").grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(ctrl, textvariable=self.var_roll_target, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        ttk.Button(ctrl, text="Set Roll", command=self.set_roll_target).grid(row=1, column=2, padx=4, pady=3)
+        ttk.Button(ctrl, text="Roll -", command=lambda: self.nudge_roll(-1.0)).grid(row=1, column=3, padx=4, pady=3)
+        ttk.Button(ctrl, text="Roll +", command=lambda: self.nudge_roll(1.0)).grid(row=1, column=4, padx=4, pady=3)
+
+        ttk.Label(ctrl, text="Step (deg)").grid(row=2, column=0, sticky="e", padx=5, pady=(8, 3))
+        ttk.Entry(ctrl, textvariable=self.var_step, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=(8, 3))
+        ttk.Button(ctrl, text="Set Current As Target", command=self.capture_current_targets).grid(row=2, column=2, padx=4, pady=(8, 3))
+        ttk.Button(ctrl, text="Set Both", command=self.set_both_targets).grid(row=2, column=3, padx=4, pady=(8, 3))
+        ttk.Button(ctrl, text="Clear Targets", command=self.clear_targets).grid(row=2, column=4, padx=4, pady=(8, 3))
+
         cfg = ttk.LabelFrame(self.frame, text="Wrist Differential Tuning", padding=10)
         cfg.pack(fill="x", pady=5)
 
@@ -770,7 +813,52 @@ class WristTuningTab:
         self.app.apply_wrist_settings()
 
     def stop_wrist(self):
-        self.send_cmd("M 5 0; M 6 0")
+        self.app.clear_wrist_targets(send_stop=True)
+
+    def set_pitch_target(self):
+        self.app.set_wrist_targets(pitch_target_deg=self.var_pitch_target.get())
+
+    def set_roll_target(self):
+        self.app.set_wrist_targets(roll_target_deg=self.var_roll_target.get())
+
+    def set_both_targets(self):
+        self.app.set_wrist_targets(
+            pitch_target_deg=self.var_pitch_target.get(),
+            roll_target_deg=self.var_roll_target.get(),
+        )
+
+    def capture_current_targets(self):
+        telemetry = self.app.get_wrist_telemetry_snapshot()
+        pitch = telemetry.get("pitch")
+        roll = telemetry.get("roll")
+        if pitch is not None:
+            self.var_pitch_target.set(float(pitch))
+        if roll is not None:
+            self.var_roll_target.set(float(roll))
+        self.set_both_targets()
+
+    def clear_targets(self):
+        self.app.clear_wrist_targets(send_stop=True)
+
+    def nudge_pitch(self, direction):
+        step = abs(float(self.var_step.get()))
+        base = self.app.get_wrist_target("pitch")
+        if base is None:
+            base = self.app.get_wrist_telemetry_snapshot().get("pitch")
+        base = 0.0 if base is None else float(base)
+        updated = base + (direction * step)
+        self.var_pitch_target.set(updated)
+        self.app.set_wrist_targets(pitch_target_deg=updated)
+
+    def nudge_roll(self, direction):
+        step = abs(float(self.var_step.get()))
+        base = self.app.get_wrist_target("roll")
+        if base is None:
+            base = self.app.get_wrist_telemetry_snapshot().get("roll")
+        base = 0.0 if base is None else float(base)
+        updated = base + (direction * step)
+        self.var_roll_target.set(updated)
+        self.app.set_wrist_targets(roll_target_deg=updated)
 
     def update_values(self, telemetry):
         pitch = telemetry.get("pitch")
@@ -787,6 +875,10 @@ class WristTuningTab:
         self.lbl_roll_error.config(text=(f"{(roll_target - roll):.1f}°" if roll is not None and roll_target is not None else "---"))
         self.lbl_motor_a.config(text=(f"{motor_a:.1f} RPM" if motor_a is not None else "---"))
         self.lbl_motor_b.config(text=(f"{motor_b:.1f} RPM" if motor_b is not None else "---"))
+        if pitch_target is not None:
+            self.var_pitch_target.set(float(pitch_target))
+        if roll_target is not None:
+            self.var_roll_target.set(float(roll_target))
 
 class SpeedTunerTab:
     def __init__(self, parent, send_cmd):
@@ -1030,14 +1122,269 @@ class PIDTunerApp:
         self.root.geometry("800x650")
 
         self.config = self.load_config()
+        self.controller_map = self.config.get("controllers", self._controller_defaults())
         self.ser = None
-        self.tabs = {}
-        self.latest_telemetry = {str(i): {"pos": None, "rpm": None, "apos": None, "amps": None, "time": 0.0} for i in range(1, 9)}
         self.running = True
-        self.cmd_queue = queue.Queue()
+        self.tabs = {}
+        self.controller_ports = {"base": None, "joint4": None, "wrist": None}
+        self.controller_serial = {"base": None, "joint4": None, "wrist": None}
+        self.controller_read_threads = {"base": None, "joint4": None, "wrist": None}
+        self.controller_tx_threads = {"base": None, "joint4": None, "wrist": None}
+        self.controller_cmd_queues = {"base": queue.Queue(), "joint4": queue.Queue(), "wrist": queue.Queue()}
+        self.controller_last_line = {"base": "", "joint4": "", "wrist": ""}
+        self.latest_telemetry = {}
+        self._abspid_skip_last_warn = {}
+        self.wrist_diff_target_logical_deg = {"pitch": None, "roll": None}
+        self.wrist_diff_pid_state = {
+            "pitch": {"integral": 0.0, "prev_error": 0.0},
+            "roll": {"integral": 0.0, "prev_error": 0.0},
+        }
+        self.wrist_diff_last_update_time = 0.0
+        self.wrist_diff_last_motor_cmd = (None, None)
 
         self.create_widgets()
-        threading.Thread(target=self.command_tx_loop, daemon=True).start()
+        self.root.after(20, self._wrist_control_tick)
+
+    def get_wrist_target(self, axis_name):
+        return self.wrist_diff_target_logical_deg.get(axis_name)
+
+    def reset_wrist_diff_pid_state(self):
+        for axis_name in ("pitch", "roll"):
+            self.wrist_diff_pid_state[axis_name]["integral"] = 0.0
+            self.wrist_diff_pid_state[axis_name]["prev_error"] = 0.0
+        self.wrist_diff_last_update_time = 0.0
+        self.wrist_diff_last_motor_cmd = (None, None)
+
+    def clear_wrist_targets(self, send_stop=False):
+        self.wrist_diff_target_logical_deg["pitch"] = None
+        self.wrist_diff_target_logical_deg["roll"] = None
+        self.reset_wrist_diff_pid_state()
+        if send_stop:
+            cfg = self.config.get("wrist_differential", {})
+            motor_a_id = int(cfg.get("motor_a_id", 5))
+            motor_b_id = int(cfg.get("motor_b_id", 6))
+            self.send_command(f"M {motor_a_id} 0; M {motor_b_id} 0")
+
+    def set_wrist_targets(self, pitch_target_deg=None, roll_target_deg=None):
+        if pitch_target_deg is not None:
+            self.wrist_diff_target_logical_deg["pitch"] = float(pitch_target_deg)
+        if roll_target_deg is not None:
+            self.wrist_diff_target_logical_deg["roll"] = float(roll_target_deg)
+        self.reset_wrist_diff_pid_state()
+
+    def _wrist_control_tick(self):
+        try:
+            self.update_wrist_diff_controller_once()
+        except Exception:
+            pass
+        if self.running:
+            self.root.after(20, self._wrist_control_tick)
+
+    def update_wrist_diff_controller_once(self):
+        cfg = self.config.get("wrist_differential", {})
+        if not bool(cfg.get("enabled", False)):
+            return False
+        if not self._connected_controller_names():
+            return False
+        pitch_target = self.wrist_diff_target_logical_deg.get("pitch")
+        roll_target = self.wrist_diff_target_logical_deg.get("roll")
+        if pitch_target is None and roll_target is None:
+            return False
+
+        telemetry = self.get_wrist_telemetry_snapshot()
+        pitch_actual = telemetry.get("pitch")
+        roll_actual = telemetry.get("roll")
+        if pitch_actual is None or roll_actual is None:
+            return False
+
+        pid_cfg = cfg.get("pid", {}) if isinstance(cfg.get("pid"), dict) else {}
+        now = time.time()
+        if self.wrist_diff_last_update_time > 0.0:
+            dt = clampf(now - self.wrist_diff_last_update_time, 0.01, 0.10)
+        else:
+            dt = 0.02
+        self.wrist_diff_last_update_time = now
+
+        axis_cmd = {}
+        all_in_deadband = True
+        for axis_name, actual_val, target_val in (
+            ("pitch", pitch_actual, pitch_target),
+            ("roll", roll_actual, roll_target),
+        ):
+            if target_val is None:
+                axis_cmd[axis_name] = 0.0
+                continue
+            err = float(target_val) - float(actual_val)
+            deadband = abs(float(pid_cfg.get("deadband_deg", 0.4)))
+            if abs(err) > deadband:
+                all_in_deadband = False
+            state = self.wrist_diff_pid_state[axis_name]
+            kp = float(pid_cfg.get(f"{axis_name}_kp", 4.0))
+            ki = float(pid_cfg.get(f"{axis_name}_ki", 0.0))
+            kd = float(pid_cfg.get(f"{axis_name}_kd", 0.0))
+            int_limit = abs(float(pid_cfg.get("integral_limit", 30.0)))
+            state["integral"] += err * dt
+            state["integral"] = clampf(state["integral"], -int_limit, int_limit)
+            deriv = (err - state["prev_error"]) / dt if dt > 1e-6 else 0.0
+            state["prev_error"] = err
+            cmd = (kp * err) + (ki * state["integral"]) + (kd * deriv)
+            max_axis_speed = abs(float(pid_cfg.get("max_axis_speed", 80.0)))
+            axis_cmd[axis_name] = clampf(cmd, -max_axis_speed, max_axis_speed)
+
+        mix = cfg.get("mix", {}) if isinstance(cfg.get("mix"), dict) else {}
+        motor_a_id = int(cfg.get("motor_a_id", 5))
+        motor_b_id = int(cfg.get("motor_b_id", 6))
+        motor_a_cmd = (
+            axis_cmd.get("pitch", 0.0) * float(mix.get("motor_a_pitch_sign", 1.0))
+            + axis_cmd.get("roll", 0.0) * float(mix.get("motor_a_roll_sign", 1.0))
+        )
+        motor_b_cmd = (
+            axis_cmd.get("pitch", 0.0) * float(mix.get("motor_b_pitch_sign", 1.0))
+            + axis_cmd.get("roll", 0.0) * float(mix.get("motor_b_roll_sign", -1.0))
+        )
+        max_motor_speed = abs(float(pid_cfg.get("max_motor_speed", 120.0)))
+        motor_a_cmd = clampf(motor_a_cmd, -max_motor_speed, max_motor_speed)
+        motor_b_cmd = clampf(motor_b_cmd, -max_motor_speed, max_motor_speed)
+
+        if all_in_deadband:
+            motor_a_cmd = 0.0
+            motor_b_cmd = 0.0
+
+        prev_a, prev_b = self.wrist_diff_last_motor_cmd
+        if prev_a is None or prev_b is None or abs(prev_a - motor_a_cmd) >= 0.5 or abs(prev_b - motor_b_cmd) >= 0.5:
+            self.send_command(f"M {motor_a_id} {motor_a_cmd:.2f}; M {motor_b_id} {motor_b_cmd:.2f}")
+            self.wrist_diff_last_motor_cmd = (motor_a_cmd, motor_b_cmd)
+        return True
+
+    def _controller_defaults(self):
+        return {
+            "base": {"port": None, "motors": [1, 2, 3]},
+            "joint4": {"port": None, "motors": [4]},
+            "wrist": {"port": None, "motors": [5, 6]},
+        }
+
+    def _sanitize_controllers(self, loaded):
+        out = self._controller_defaults()
+        if not isinstance(loaded, dict):
+            return out
+        for name in ("base", "joint4", "wrist"):
+            raw = loaded.get(name, {}) if isinstance(loaded.get(name, {}), dict) else {}
+            port = raw.get("port")
+            out[name]["port"] = None if port in (None, "") else str(port)
+            motors = raw.get("motors")
+            if isinstance(motors, list):
+                vals = []
+                for mid in motors:
+                    try:
+                        vals.append(int(mid))
+                    except Exception:
+                        pass
+                if vals:
+                    out[name]["motors"] = vals
+        return out
+
+    def _controller_for_motor(self, mid):
+        try:
+            motor_id = int(mid)
+        except Exception:
+            return "base"
+        for name, cfg in self.controller_map.items():
+            if motor_id in set(cfg.get("motors", [])):
+                return name
+        return "base"
+
+    def _connected_controller_names(self):
+        return [name for name, conn in self.controller_serial.items() if conn and conn.is_open]
+
+    def _sync_legacy_serial_ref(self):
+        self.ser = self.controller_serial.get("base") or self.controller_serial.get("joint4") or self.controller_serial.get("wrist")
+
+    def _controller_has_fresh_telemetry(self, controller_name):
+        cfg = self.controller_map.get(controller_name, {}) if isinstance(self.controller_map.get(controller_name, {}), dict) else {}
+        motor_ids = cfg.get("motors", []) if isinstance(cfg.get("motors", []), list) else []
+        now = time.time()
+        for mid in motor_ids:
+            tele = self.latest_telemetry.get(str(mid), {})
+            ts = tele.get("time")
+            if ts is None:
+                continue
+            try:
+                if (now - float(ts)) <= 2.0:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _controller_owns_motor(self, controller_name, motor_id):
+        cfg = self.controller_map.get(controller_name, {}) if isinstance(self.controller_map.get(controller_name, {}), dict) else {}
+        assigned = cfg.get("motors", []) if isinstance(cfg.get("motors", []), list) else []
+        if not assigned:
+            return True
+        assigned_ids = set()
+        for mid in assigned:
+            try:
+                assigned_ids.add(int(mid))
+            except Exception:
+                pass
+        if not assigned_ids:
+            return True
+        try:
+            return int(motor_id) in assigned_ids
+        except Exception:
+            return False
+
+    def refresh_controller_port_status(self):
+        parts = []
+        for name in ("base", "joint4", "wrist"):
+            configured = self.controller_map.get(name, {}).get("port")
+            opened = self.controller_ports.get(name)
+            conn = self.controller_serial.get(name)
+            is_open = bool(conn and conn.is_open)
+            live = self._controller_has_fresh_telemetry(name)
+            state = "LIVE" if live else ("OPEN" if is_open else "OFF")
+            shown_port = opened or configured or "-"
+            extra = ""
+            if configured and opened and configured != opened:
+                extra = f" cfg:{configured}"
+            parts.append(f"{name}:{shown_port} {state}{extra}")
+        if hasattr(self, "lbl_controller_ports"):
+            self.lbl_controller_ports.config(text="Controller Ports: " + " | ".join(parts))
+
+    def _parse_command_segments(self, cmd):
+        return [part.strip() for part in str(cmd).split(";") if part.strip()]
+
+    def _route_segment(self, segment):
+        toks = segment.split()
+        if not toks:
+            return set()
+        op = toks[0].upper()
+        if op in {"S", "TON", "TOFF", "T"}:
+            return {"base", "joint4", "wrist"}
+        if op in {"P", "PR", "M", "MV", "KP", "KI", "KD", "AOL", "SKP", "SKI", "SKD", "SOL", "ABSPID", "CAL", "JLIM", "GEAR"} and len(toks) >= 2:
+            return {self._controller_for_motor(toks[1])}
+        if op == "ENCMAP":
+            if len(toks) >= 3 and toks[2] != "0":
+                return {self._controller_for_motor(toks[2])}
+            return {"base", "joint4", "wrist"}
+        return {"base", "joint4", "wrist"}
+
+    def _route_command_packets(self, cmd):
+        routed = {"base": [], "joint4": [], "wrist": []}
+        for segment in self._parse_command_segments(cmd):
+            for name in self._route_segment(segment):
+                routed[name].append(segment)
+        return {name: "; ".join(parts) for name, parts in routed.items() if parts}
+
+    def _clear_pending_commands_for(self, controller_name=None):
+        names = [controller_name] if controller_name else ["base", "joint4", "wrist"]
+        for name in names:
+            q = self.controller_cmd_queues[name]
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                except Exception:
+                    break
 
     def _sanitize_motor_config(self, raw_motor, default_motor):
         cfg = dict(default_motor)
@@ -1090,13 +1437,14 @@ class PIDTunerApp:
         return cfg
 
     def _sanitize_config(self, loaded):
-        out = {"motors": {}, "wrist_differential": json.loads(json.dumps(DEFAULT_CONFIG["wrist_differential"]))}
+        out = {"controllers": self._controller_defaults(), "motors": {}, "wrist_differential": json.loads(json.dumps(DEFAULT_CONFIG["wrist_differential"]))}
         loaded_motors = loaded.get("motors", {}) if isinstance(loaded, dict) else {}
         for i in range(1, 7):
             mid = str(i)
             default_motor = DEFAULT_CONFIG["motors"][mid]
             raw_motor = loaded_motors.get(mid, {}) if isinstance(loaded_motors, dict) else {}
             out["motors"][mid] = self._sanitize_motor_config(raw_motor, default_motor)
+        out["controllers"] = self._sanitize_controllers(loaded.get("controllers", {}) if isinstance(loaded, dict) else {})
         loaded_wrist = loaded.get("wrist_differential", {}) if isinstance(loaded, dict) else {}
         if isinstance(loaded_wrist, dict):
             out["wrist_differential"].update({k: v for k, v in loaded_wrist.items() if k not in {"mix", "pid"}})
@@ -1152,6 +1500,9 @@ class PIDTunerApp:
         self.btn_connect.pack(side="right")
         self.lbl_status = ttk.Label(top_frame, text="Disconnected", foreground="red")
         self.lbl_status.pack(side="right", padx=10)
+
+        self.lbl_controller_ports = ttk.Label(self.root, text="Controller Ports: base=-, joint4=-, wrist=-", anchor="w", justify="left")
+        self.lbl_controller_ports.pack(fill="x", padx=10)
 
         quick_frame = ttk.Frame(self.root, padding=(10, 0, 10, 6))
         quick_frame.pack(fill="x", side="top")
@@ -1235,61 +1586,102 @@ class PIDTunerApp:
         self.log_box.tag_config("info",      foreground="#b5cea8")
         self.log_box.tag_config("sent",      foreground="#dca54e")
         self._log_line_count = 0
+        self.refresh_controller_port_status()
 
     def find_serial_port(self):
-        ports = serial.tools.list_ports.comports()
+        ports = self.find_serial_ports()
+        return ports[0] if ports else None
+
+    def find_serial_ports(self):
+        ports = list(serial.tools.list_ports.comports())
+        preferred, fallback = [], []
         for port in ports:
-            if "CH340" in port.description or "Arduino" in port.description or "Serial" in port.description:
-                return port.device
-        return ports[0].device if ports else None
+            desc = f"{port.description} {port.device}".lower()
+            if any(token in desc for token in ("ch340", "arduino", "serial", "usb")):
+                preferred.append(port.device)
+            else:
+                fallback.append(port.device)
+        ordered = []
+        for device in preferred + fallback:
+            if device not in ordered:
+                ordered.append(device)
+        return ordered
+
+    def _ordered_controller_ports(self):
+        available = self.find_serial_ports()
+        ordered = []
+        used = set()
+        for name in ("base", "joint4", "wrist"):
+            port = self.controller_map.get(name, {}).get("port")
+            if port and port in available and port not in used:
+                ordered.append((name, port))
+                used.add(port)
+        for name in ("base", "joint4", "wrist"):
+            if any(existing_name == name for existing_name, _ in ordered):
+                continue
+            remaining = [port for port in available if port not in used]
+            if not remaining:
+                break
+            ordered.append((name, remaining[0]))
+            used.add(remaining[0])
+        return ordered
 
     def disconnect_serial(self):
         """Helper to cleanly update the UI when the serial connection is lost or closed."""
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-        self.ser = None
-        while not self.cmd_queue.empty():
-            try:
-                self.cmd_queue.get_nowait()
-                self.cmd_queue.task_done()
-            except Exception:
-                break
+        for name, conn in list(self.controller_serial.items()):
+            if conn and conn.is_open:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self.controller_serial[name] = None
+            self.controller_ports[name] = None
+            self.controller_read_threads[name] = None
+            self.controller_tx_threads[name] = None
+            self.controller_last_line[name] = ""
+        self._clear_pending_commands_for()
+        self._sync_legacy_serial_ref()
+        self.clear_wrist_targets(send_stop=False)
         self.btn_connect.config(text="Connect to Arm")
         self.lbl_status.config(text="Disconnected", foreground="red")
+        self.refresh_controller_port_status()
         self.status_bar.config(text="Disconnected from serial.")
 
     def toggle_serial(self):
-        if self.ser and self.ser.is_open:
+        if self._connected_controller_names():
             self.disconnect_serial()
         else:
-            port = self.find_serial_port()
-            if not port:
+            assignments = self._ordered_controller_ports()
+            if not assignments:
                 messagebox.showerror("No Device", "Could not find a connected Arduino device.")
                 return
 
             try:
-                self.ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
-                time.sleep(2)
+                for name, port in assignments:
+                    conn = serial.Serial(port, BAUD_RATE, timeout=0.1)
+                    time.sleep(2)
+                    self.controller_ports[name] = port
+                    self.controller_serial[name] = conn
+                    self.controller_read_threads[name] = threading.Thread(target=self.serial_read_loop, args=(name,), daemon=True)
+                    self.controller_read_threads[name].start()
+                    tx = threading.Thread(target=self.command_tx_loop, args=(name,), daemon=True)
+                    self.controller_tx_threads[name] = tx
+                    tx.start()
+                self._sync_legacy_serial_ref()
                 self.btn_connect.config(text="Disconnect")
-                self.lbl_status.config(text=f"Connected ({port})", foreground="green")
-                self.status_bar.config(text=f"Connected successfully to {port} @ {BAUD_RATE} baud.")
-
-                # Start background serial read thread first
-                threading.Thread(target=self.serial_read_loop, daemon=True).start()
-                time.sleep(0.15)  # Give thread a moment to start
+                self.lbl_status.config(text=f"Connected ({', '.join(f'{name}:{self.controller_ports[name]}' for name, _ in assignments)})", foreground="green")
+                self.refresh_controller_port_status()
 
                 # TON is idempotent (unlike T toggle) - safe to call on every connect
                 self.send_command("TON")
 
                 # Do not auto-apply file settings on connect.
                 # Bad saved values can make motors appear dead until power cycle.
-                self.status_bar.config(text=f"Connected to {port}. Live control ready. Use 'Apply ALL' only after reviewing values.")
+                self.status_bar.config(text="Connected to controller set. Live control ready. Use 'Apply ALL' only after reviewing values.")
 
             except Exception as e:
-                messagebox.showerror("Connection Error", f"Could not connect to {port}:\n{e}")
+                messagebox.showerror("Connection Error", f"Could not connect to controllers:\n{e}")
+                self.disconnect_serial()
 
     @staticmethod
     def _safe_float(value):
@@ -1301,22 +1693,51 @@ class PIDTunerApp:
             return None
         return f
 
-    def serial_read_loop(self):
-        while self.running and self.ser and self.ser.is_open:
+    def _handle_abspid_skip_warning(self, controller_name, line):
+        m = re.search(r"M(\d+)\s+ABSPID\s+skipped:\s*(.+)$", line)
+        if not m:
+            return
+        mid = m.group(1)
+        reason = m.group(2).strip()
+        now = time.time()
+        warn_key = f"{controller_name}:{mid}:{reason}"
+        last = self._abspid_skip_last_warn.get(warn_key, 0.0)
+        if (now - last) < 2.0:
+            return
+        self._abspid_skip_last_warn[warn_key] = now
+
+        hint = reason
+        if "no encoder mapped" in reason.lower():
+            hint = (
+                "no encoder mapped. Set Abs Encoder Index for this motor, "
+                "then click 'Apply Encoder Mappings' before enabling ABS PID."
+            )
+        self.status_bar.config(text=f"[{controller_name}] M{mid} ABSPID skipped: {hint}")
+
+    def serial_read_loop(self, controller_name):
+        conn = self.controller_serial.get(controller_name)
+        while self.running and conn and conn.is_open:
             try:
-                if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if conn.in_waiting > 0:
+                    line = conn.readline().decode('utf-8', errors='ignore').strip()
                     if not line:
                         continue
+                    self.controller_last_line[controller_name] = line
 
                     # Append raw line to the log panel (thread-safe)
-                    self.root.after(0, self.log_append, line)
+                    self.root.after(0, self.log_append, f"[{controller_name}] {line}")
+
+                    if "ABSPID skipped:" in line:
+                        self.root.after(0, self._handle_abspid_skip_warning, controller_name, line)
+                        continue
 
                     # Keep target labels synced even when commands originate
                     # outside this app (e.g. IK tool / serial monitor).
                     m_pr = re.search(r"^M(\d+)\s+PR\s+[-+]?\d*\.?\d+\s+->\s+log\s+([-+]?\d*\.?\d+)", line)
                     if m_pr:
                         mid = m_pr.group(1)
+                        if not self._controller_owns_motor(controller_name, mid):
+                            continue
                         tgt = self._safe_float(m_pr.group(2))
                         if tgt is not None:
                             self.root.after(0, self._set_target_from_firmware, mid, tgt)
@@ -1325,6 +1746,8 @@ class PIDTunerApp:
                     m_p = re.search(r"^M(\d+)\s+->\s+log\s+([-+]?\d*\.?\d+)", line)
                     if m_p:
                         mid = m_p.group(1)
+                        if not self._controller_owns_motor(controller_name, mid):
+                            continue
                         tgt = self._safe_float(m_p.group(2))
                         if tgt is not None:
                             self.root.after(0, self._set_target_from_firmware, mid, tgt)
@@ -1347,12 +1770,14 @@ class PIDTunerApp:
                         if not mid_m:
                             continue
 
-                        pos_m = re.search(r"POS:([^\s|]+)", token)
-                        apos_m = re.search(r"APOS:([^\s|]+)", token)
+                        pos_m = re.search(r"(?:^|\s)POS:([^\s|]+)", token)
+                        apos_m = re.search(r"(?:^|\s)APOS:([^\s|]+)", token)
                         rpm_m = re.search(r"RPM:([^\s|]+)", token)
                         amp_m = re.search(r"A:([^\s|]+)", token)
 
                         mid = mid_m.group(1)
+                        if not self._controller_owns_motor(controller_name, mid):
+                            continue
                         pos = pos_m.group(1) if pos_m else None
                         apos = apos_m.group(1) if apos_m else None
                         rpm = rpm_m.group(1) if rpm_m else None
@@ -1369,17 +1794,36 @@ class PIDTunerApp:
                 break
 
     def update_telemetry_ui(self, mid, pos, rpm="---", apos=None, amps=None):
+        key = str(mid)
+        prev = self.latest_telemetry.get(key, {})
+
         pos_f = self._safe_float(pos) if pos is not None else None
         rpm_f = self._safe_float(rpm) if rpm is not None else None
         apos_f = self._safe_float(apos) if apos is not None else None
         amp_f = self._safe_float(amps) if amps is not None else None
-        self.latest_telemetry[str(mid)] = {"pos": pos_f, "rpm": rpm_f, "apos": apos_f, "amps": amp_f, "time": time.time()}
+
+        # Some telemetry tokens omit APOS/POS intermittently. Keep last known
+        # valid values instead of replacing with None to avoid UI flicker.
+        if pos_f is None:
+            pos_f = prev.get("pos")
+        if rpm_f is None:
+            rpm_f = prev.get("rpm")
+        if apos_f is None:
+            apos_f = prev.get("apos")
+        if amp_f is None:
+            amp_f = prev.get("amps")
+
+        # Current Angle should track firmware logical POS (CAL / P / PR frame).
+        # APOS is shown separately as raw absolute encoder position.
+        display_deg = pos_f
+        self.latest_telemetry[key] = {"pos": pos_f, "display_deg": display_deg, "rpm": rpm_f, "apos": apos_f, "amps": amp_f, "time": time.time()}
+        self.refresh_controller_port_status()
 
         if mid in self.tabs:
             tab = self.tabs[mid]
             tab._last_telemetry_time = time.time()
 
-            tab.lbl_current_angle.config(text=(f"{pos_f:.1f}°" if pos_f is not None else "N/A"), foreground="blue")
+            tab.lbl_current_angle.config(text=(f"{display_deg:.1f}°" if display_deg is not None else "N/A"), foreground="blue")
             tab.lbl_current_rpm.config(text=(f"{rpm_f:.1f} RPM" if rpm_f is not None else "N/A"), foreground="green")
 
             if apos_f is not None:
@@ -1389,8 +1833,8 @@ class PIDTunerApp:
                 tab.lbl_abs_pos.config(text="N/A", foreground="orange")
                 tab._gauge_abs_deg = None
 
-            if pos_f is not None:
-                tab._gauge_current_deg = pos_f
+            if display_deg is not None:
+                tab._gauge_current_deg = display_deg
 
             if mid == "5":
                 self.wrist_tab.m5_apos = apos_f
@@ -1418,10 +1862,16 @@ class PIDTunerApp:
         roll_raw = self.latest_telemetry.get(roll_mid, {}).get("apos")
         pitch_zero = float(self.config.get("motors", {}).get(pitch_joint, {}).get("abs_zero_offset", 0.0))
         roll_zero = float(self.config.get("motors", {}).get(roll_joint, {}).get("abs_zero_offset", 0.0))
-        pitch = None if pitch_raw is None else pitch_raw - pitch_zero
-        roll = None if roll_raw is None else roll_raw - roll_zero
-        pitch_target = self.tabs.get(pitch_joint).target_deg if self.tabs.get(pitch_joint) else None
-        roll_target = self.tabs.get(roll_joint).target_deg if self.tabs.get(roll_joint) else None
+        motor_a_logical = None if pitch_raw is None else pitch_raw - pitch_zero
+        motor_b_logical = None if roll_raw is None else roll_raw - roll_zero
+        mix_cfg = cfg.get("mix", {}) if isinstance(cfg.get("mix"), dict) else {}
+        if motor_a_logical is None or motor_b_logical is None:
+            pitch = None
+            roll = None
+        else:
+            pitch, roll = invert_wrist_mix(motor_a_logical, motor_b_logical, mix_cfg)
+        pitch_target = self.wrist_diff_target_logical_deg.get("pitch")
+        roll_target = self.wrist_diff_target_logical_deg.get("roll")
         motor_a_mid = str(int(cfg.get("motor_a_id", 5)))
         motor_b_mid = str(int(cfg.get("motor_b_id", 6)))
         return {
@@ -1490,12 +1940,7 @@ class PIDTunerApp:
         return False
 
     def _clear_pending_commands(self):
-        while not self.cmd_queue.empty():
-            try:
-                self.cmd_queue.get_nowait()
-                self.cmd_queue.task_done()
-            except Exception:
-                break
+        self._clear_pending_commands_for()
 
     def _update_target_labels_from_cmd(self, cmd):
         parts = [p.strip() for p in cmd.split(";") if p.strip()]
@@ -1544,29 +1989,35 @@ class PIDTunerApp:
                     if tab._gauge_current_deg is not None:
                         tab._set_target_display(tab._gauge_current_deg)
 
-    def command_tx_loop(self):
+    def command_tx_loop(self, controller_name):
         while self.running:
             try:
-                cmd = self.cmd_queue.get(timeout=0.1)
+                cmd = self.controller_cmd_queues[controller_name].get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
-                if self.ser and self.ser.is_open:
-                    self.ser.write((cmd + '\n').encode('utf-8'))
+                conn = self.controller_serial.get(controller_name)
+                if conn and conn.is_open:
+                    conn.write((cmd + '\n').encode('utf-8'))
                 time.sleep(0.015)
             except Exception:
                 pass
             finally:
-                self.cmd_queue.task_done()
+                self.controller_cmd_queues[controller_name].task_done()
 
     def send_command(self, cmd):
-        if self.ser and self.ser.is_open:
+        if self._connected_controller_names():
             try:
                 if self._is_motion_command(cmd):
                     self._clear_pending_commands()
                 self._update_target_labels_from_cmd(cmd)
-                self.cmd_queue.put(cmd)
+                routed = self._route_command_packets(cmd)
+                for name, packet in routed.items():
+                    conn = self.controller_serial.get(name)
+                    if conn and conn.is_open:
+                        self.controller_cmd_queues[name].put(packet)
                 self.status_bar.config(text=f"Queued: {cmd}")
+                self.root.after(0, self._log_sent, cmd)
             except Exception as e:
                 messagebox.showerror("Serial Error", f"Failed to queue command:\n{e}")
                 self.toggle_serial()
@@ -1588,6 +2039,16 @@ class PIDTunerApp:
             messagebox.showwarning("Not Connected", "Please connect to the arm first to apply settings alive.")
             return
 
+        # Sync all UI values back into config before building command packets.
+        for tab in self.tabs.values():
+            tab.on_change()
+        if hasattr(self, "wrist_tuning_tab"):
+            self.wrist_tuning_tab.on_change()
+
+        # Safe bring-up first: stop anything stale and ensure telemetry is ON.
+        self.send_command("S; TON")
+        time.sleep(0.05)
+
         for mid, tab in self.tabs.items():
             # Batch all commands for this motor into one semicolon-separated string
             gr   = tab.config.get("gear_ratio", 1.0)
@@ -1608,10 +2069,20 @@ class PIDTunerApp:
             self.send_command(batch)
             time.sleep(0.05)
 
+        # Global encoder remap pass from motor tabs.
         self.apply_encoder_mappings(show_status=False)
+
+        # Wrist-specific remap (only applies when wrist differential is enabled
+        # and wrist controller is actually connected).
         self.apply_wrist_settings(show_status=False)
+
+        skipped_abs_pid = []
         for mid, tab in self.tabs.items():
             enable = 1 if bool(tab.config.get("abs_pid_enabled", False)) else 0
+            if tab.config.get("abs_encoder_index") is None:
+                enable = 0
+                if bool(tab.config.get("abs_pid_enabled", False)):
+                    skipped_abs_pid.append(int(mid))
             if self.config.get("wrist_differential", {}).get("enabled", False) and mid in {
                 str(int(self.config["wrist_differential"].get("pitch_joint_id", 5))),
                 str(int(self.config["wrist_differential"].get("roll_joint_id", 6)))
@@ -1620,7 +2091,15 @@ class PIDTunerApp:
             self.send_command(f"ABSPID {mid} {enable}")
             time.sleep(0.02)
 
-        self.status_bar.config(text="All Gear Ratios and PIDs applied to Arm!")
+        if skipped_abs_pid:
+            self.status_bar.config(
+                text=(
+                    "Applied ALL settings. ABS PID auto-disabled for motors without encoder mapping: "
+                    + ", ".join(f"M{m}" for m in sorted(skipped_abs_pid))
+                )
+            )
+        else:
+            self.status_bar.config(text="Applied ALL settings: gear, limits, PID, ENCMAP, ABSPID, telemetry ON.")
 
     def apply_encoder_mappings(self, show_status=True):
         if not self.ser or not self.ser.is_open:
@@ -1683,6 +2162,15 @@ class PIDTunerApp:
                 messagebox.showwarning("Not Connected", "Please connect to the arm first.")
             return
         cfg = self.config.get("wrist_differential", {})
+        if not bool(cfg.get("enabled", False)):
+            if show_status:
+                self.status_bar.config(text="Wrist differential disabled; wrist encoder remap skipped.")
+            return
+        wrist_conn = self.controller_serial.get("wrist")
+        if not (wrist_conn and wrist_conn.is_open):
+            if show_status:
+                self.status_bar.config(text="Wrist controller not connected; skipped wrist encoder remap.")
+            return
         pitch_enc = cfg.get("pitch_encoder_index")
         roll_enc = cfg.get("roll_encoder_index")
         pitch_mid = int(cfg.get("pitch_encoder_motor_id", 5))
