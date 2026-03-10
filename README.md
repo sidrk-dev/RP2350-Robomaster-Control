@@ -137,8 +137,9 @@ First, make sure to install dependencies:
 pip install ikpy pyserial matplotlib numpy scipy pynput
 ```
 
-- **`ik_arm_control.py`**: A full 3D Inverse Kinematics visualizer and control panel for a 6-DOF robot arm. Features high refresh rate 3D visualization, WASD positional controls, Roll/Pitch/Yaw orientation controls, and live execution.
-- **`pid_tuner.py`**: A dedicated Tkinter GUI for configuring motor parameters. Tune Angle and Speed PID loops with live telemetry, set external gear ratios, set motor types, and save configurations to `robot_config.json`.
+- **`ik_dashboard_qt.py`** (**Primary / Main arm dashboard**): Recommended day-to-day control UI for IK + runtime operation (reconnect handling, verify flow, execute/live controls).
+- **`pid_tuner.py`** (**Primary tuning tool**): Dedicated Tkinter GUI for motor parameter maintenance (PID, limits, ENCMAP/ABSPID, and config persistence).
+- **`ik_arm_control.py`**: Backend + legacy visualizer internals used by the Qt dashboard.
 - **`keyboard_control.py`**: Hold `W` to spin RoboMaster Motor 1 forward, `S` to spin backward. `Q` to quit.
 - **`differential_wrist_control.py`**: Uses WASD to control a differential wrist attached to Motors 1 and 2. `W/S` for Pitch, `A/D` for Roll.
 - **`cytron_control.py`**: Hold `U` to spin the Cytron motor forward (PWM 255), `J` to spin backward. `Q` to quit.

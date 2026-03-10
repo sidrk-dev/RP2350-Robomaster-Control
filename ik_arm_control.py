@@ -56,6 +56,7 @@ controller_read_threads = {"base": None, "joint4": None, "wrist": None}
 controller_tx_threads = {"base": None, "joint4": None, "wrist": None}
 controller_cmd_queues = {"base": queue.Queue(), "joint4": queue.Queue(), "wrist": queue.Queue()}
 controller_last_telemetry_line = {"base": "", "joint4": "", "wrist": ""}
+expected_controller_names = set()
 my_chain = None
 current_target_xyz = [0.2, 0.0, 0.3]  # Default safe position
 current_target_rpy = [0.0, 0.0, 0.0]  # Roll, Pitch, Yaw
@@ -121,6 +122,7 @@ wrist_diff_pid_state = {
 wrist_diff_last_update_time = 0.0
 wrist_diff_last_motor_cmd = (None, None)
 hand_pwm_command = 0
+abspid_skip_state = {}
 
 TELEMETRY_STALE_SEC = 1.0
 AUTO_MOVE_TO_ZERO_ON_CONNECT = True
@@ -193,8 +195,59 @@ def _controller_for_motor(mid):
     return "base"
 
 
+def _controller_owns_motor(controller_name, motor_id):
+    cfg = controller_config.get(controller_name, {}) if isinstance(controller_config.get(controller_name, {}), dict) else {}
+    assigned = cfg.get("motors", []) if isinstance(cfg.get("motors", []), list) else []
+    if not assigned:
+        return True
+    assigned_ids = set()
+    for mid in assigned:
+        try:
+            assigned_ids.add(int(mid))
+        except Exception:
+            pass
+    if not assigned_ids:
+        return True
+    try:
+        return int(motor_id) in assigned_ids
+    except Exception:
+        return False
+
+
 def _connected_controller_names():
     return [name for name, conn in controller_serial.items() if conn and conn.is_open]
+
+
+def _required_controller_names():
+    if expected_controller_names:
+        return set(expected_controller_names)
+    return set(_connected_controller_names())
+
+
+def all_required_controllers_healthy(require_fresh=True):
+    required = _required_controller_names()
+    if not required:
+        return False
+    now = time.time()
+    for name in sorted(required):
+        conn = controller_serial.get(name)
+        if not (conn and conn.is_open):
+            return False
+        if require_fresh:
+            fresh = False
+            for mid in CONTROLLER_MOTOR_GROUPS.get(name, set()):
+                ts = latest_motor_telemetry_time.get(int(mid))
+                if ts is None:
+                    continue
+                try:
+                    if (now - float(ts)) <= TELEMETRY_STALE_SEC:
+                        fresh = True
+                        break
+                except Exception:
+                    continue
+            if not fresh:
+                return False
+    return True
 
 
 def _get_primary_serial():
@@ -218,6 +271,18 @@ def _connected_controller_count():
     return len(_connected_controller_names())
 
 
+def is_serial_connected():
+    return _connected_controller_count() > 0
+
+
+def clear_abspid_skip_state():
+    abspid_skip_state.clear()
+
+
+def get_abspid_skip_state():
+    return dict(abspid_skip_state)
+
+
 def _parse_command_segments(cmd):
     return [part.strip() for part in str(cmd).split(";") if part.strip()]
 
@@ -229,7 +294,7 @@ def _route_segment(segment):
     op = toks[0].upper()
     if op in BROADCAST_COMMANDS:
         return set(CONTROLLER_MOTOR_GROUPS.keys())
-    if op in {"P", "PR", "M", "MV", "KP", "KI", "KD", "AOL", "SKP", "SKI", "SKD", "SOL", "ABSPID", "CAL", "JLIM"}:
+    if op in {"P", "PR", "M", "MV", "KP", "KI", "KD", "AOL", "SKP", "SKI", "SKD", "SOL", "ABSPID", "CAL", "JLIM", "GEAR"}:
         if len(toks) >= 2:
             return {_controller_for_motor(toks[1])}
     if op == "ENCMAP":
@@ -238,6 +303,10 @@ def _route_segment(segment):
             if str(target_motor) == "0":
                 return set(CONTROLLER_MOTOR_GROUPS.keys())
             return {_controller_for_motor(target_motor)}
+        return set(CONTROLLER_MOTOR_GROUPS.keys())
+    if op == "ENCREVSET":
+        if len(toks) >= 4:
+            return {_controller_for_motor(toks[3])}
         return set(CONTROLLER_MOTOR_GROUPS.keys())
     if op in {"HAND", "HOPEN", "HCLOSE", "HSTOP"}:
         return {"wrist"}
@@ -263,6 +332,46 @@ def _clear_pending_commands(controller_name=None):
                 q.task_done()
             except Exception:
                 break
+
+
+def _clear_controller_owned_telemetry(controller_name):
+    for mid in list(CONTROLLER_MOTOR_GROUPS.get(controller_name, set())):
+        latest_motor_pos_deg.pop(int(mid), None)
+        latest_motor_apos_deg.pop(int(mid), None)
+        latest_motor_telemetry_time.pop(int(mid), None)
+
+
+def _handle_controller_disconnect(controller_name, reason=""):
+    conn = controller_serial.get(controller_name)
+    if conn and conn.is_open:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    controller_serial[controller_name] = None
+    controller_ports[controller_name] = None
+    controller_read_threads[controller_name] = None
+    controller_tx_threads[controller_name] = None
+    controller_last_telemetry_line[controller_name] = ""
+    _clear_pending_commands(controller_name)
+    _clear_controller_owned_telemetry(controller_name)
+    _sync_legacy_serial_refs()
+    update_connection_button()
+    detail = f" ({reason})" if reason else ""
+    print(f"Controller {controller_name} disconnected{detail}.")
+
+
+def _reset_command_tracking_state():
+    global last_command_wall_time
+    last_command_wall_time = 0.0
+    for mid in last_sent_logical_deg:
+        last_sent_logical_deg[mid] = None
+
+
+def reset_runtime_motion_state():
+    clear_wrist_diff_targets(send_stop=False)
+    _reset_command_tracking_state()
+    _clear_pending_commands()
 
 
 def set_hand_pwm(pwm_value):
@@ -419,7 +528,7 @@ def clear_wrist_diff_targets(send_stop=False):
     wrist_diff_target_logical_deg["pitch"] = None
     wrist_diff_target_logical_deg["roll"] = None
     reset_wrist_diff_pid_state()
-    if send_stop and ser and ser.is_open and wrist_diff_enabled():
+    if send_stop and is_serial_connected() and wrist_diff_enabled():
         motor_a_id, motor_b_id = wrist_diff_motor_ids()
         send_command(f"M {motor_a_id} 0; M {motor_b_id} 0")
 
@@ -542,7 +651,21 @@ def normalize_target_for_limits(target_deg, min_a, max_a, reference_deg=None):
         reference_deg = (min_a + max_a) * 0.5
     else:
         reference_deg = clampf(reference_deg, min_a, max_a)
-    return clampf(nearest_equivalent(target_deg, reference_deg), min_a, max_a)
+
+    # For limited joints, do not "wrap then clamp" (that can pin to a hard stop).
+    # Instead, choose a 360°-equivalent target that already lies inside bounds.
+    candidates = []
+    min_turns = int(math.floor((min_a - target_deg) / 360.0)) - 1
+    max_turns = int(math.ceil((max_a - target_deg) / 360.0)) + 1
+    for turns in range(min_turns, max_turns + 1):
+        cand = target_deg + (360.0 * turns)
+        if min_a <= cand <= max_a:
+            candidates.append(cand)
+
+    if candidates:
+        return min(candidates, key=lambda cand: abs(cand - reference_deg))
+
+    return clampf(target_deg, min_a, max_a)
 
 
 def shortest_delta_deg(current_deg, target_deg):
@@ -626,15 +749,84 @@ def load_robot_config():
         print(f"Warning: Failed to load {CONFIG_FILE}: {e}")
 
 
+def get_expected_runtime_apply_plan():
+    desired_enc_map_by_controller = {name: {} for name in CONTROLLER_MOTOR_GROUPS.keys()}
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        cfg = robot_config.get(str(mid), {})
+        enc_idx = cfg.get("abs_encoder_index")
+        if enc_idx is None:
+            continue
+        try:
+            mid_i = int(mid)
+            enc_i = int(enc_idx)
+            controller_name = _controller_for_motor(mid_i)
+            desired_enc_map_by_controller.setdefault(controller_name, {})[enc_i] = mid_i
+        except Exception:
+            pass
+
+    wrist_conn = controller_serial.get("wrist")
+    wrist_online = bool(wrist_conn and wrist_conn.is_open)
+    if wrist_diff_enabled() and wrist_online:
+        diff_cfg = get_wrist_diff_config()
+        for enc_key, motor_key in (("pitch_encoder_index", "pitch_encoder_motor_id"),
+                                   ("roll_encoder_index", "roll_encoder_motor_id")):
+            enc_idx = diff_cfg.get(enc_key)
+            motor_id = diff_cfg.get(motor_key)
+            try:
+                if enc_idx is not None:
+                    motor_i = int(motor_id)
+                    enc_i = int(enc_idx)
+                    controller_name = _controller_for_motor(motor_i)
+                    desired_enc_map_by_controller.setdefault(controller_name, {})[enc_i] = motor_i
+            except Exception:
+                pass
+
+    wrist_joint_set = set(wrist_diff_joint_ids()) if wrist_diff_enabled() else set()
+    abspid_enable_by_motor = {}
+    skipped_abs_pid = []
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        cfg = robot_config.get(str(mid), {})
+        enable = 1 if bool(cfg.get("abs_pid_enabled", False)) else 0
+        if cfg.get("abs_encoder_index") is None:
+            if enable == 1:
+                skipped_abs_pid.append(int(mid))
+            enable = 0
+        if wrist_diff_enabled() and wrist_online and int(mid) in wrist_joint_set:
+            enable = 0
+        abspid_enable_by_motor[int(mid)] = int(enable)
+
+    return {
+        "connected_controllers": _connected_controller_names(),
+        "wrist_online": wrist_online,
+        "wrist_diff_enabled": bool(wrist_diff_enabled()),
+        "enc_map_by_controller": desired_enc_map_by_controller,
+        "abspid_enable_by_motor": abspid_enable_by_motor,
+        "abspid_skipped_unmapped": sorted(set(skipped_abs_pid)),
+    }
+
+
 def apply_robot_config_to_arm():
-    if not (ser and ser.is_open):
+    _sync_legacy_serial_refs()
+    if not is_serial_connected():
         print("Config apply skipped: serial not connected.")
+        return False
+    if not all_required_controllers_healthy(require_fresh=False):
+        print("Config apply aborted: one or more required controllers are offline.")
         return False
     if not robot_config:
         print("Config apply skipped: robot_config is empty.")
         return False
 
+    clear_abspid_skip_state()
+
+    # Safe bring-up first to avoid stale runtime state on reconnect.
+    send_command("S; TON")
+    time.sleep(0.05)
+
     for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        if not all_required_controllers_healthy(require_fresh=False):
+            print("Config apply aborted: controller dropped during gain/limit apply.")
+            return False
         cfg = robot_config.get(str(mid), {})
         try:
             gr = float(cfg.get("gear_ratio", 1.0))
@@ -661,21 +853,26 @@ def apply_robot_config_to_arm():
         send_command(batch)
         time.sleep(0.05)
 
-    encoder_slots = set()
-    for mid in robot_config:
-        enc_idx = robot_config.get(str(mid), {}).get("abs_encoder_index")
+    desired_enc_map_by_controller = {name: {} for name in CONTROLLER_MOTOR_GROUPS.keys()}
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        if not all_required_controllers_healthy(require_fresh=False):
+            print("Config apply aborted: controller dropped during ENCREVSET apply.")
+            return False
+        cfg = robot_config.get(str(mid), {})
+        enc_idx = cfg.get("abs_encoder_index")
         if enc_idx is None:
             continue
         try:
-            encoder_slots.add(int(enc_idx))
+            mid_i = int(mid)
+            enc_i = int(enc_idx)
+            controller_name = _controller_for_motor(mid_i)
+            desired_enc_map_by_controller.setdefault(controller_name, {})[enc_i] = mid_i
         except Exception:
             pass
 
-    for enc_idx in sorted(encoder_slots):
-        send_command(f"ENCMAP {enc_idx} 0")
-        time.sleep(0.01)
-
-    if wrist_diff_enabled():
+    wrist_conn = controller_serial.get("wrist")
+    wrist_online = bool(wrist_conn and wrist_conn.is_open)
+    if wrist_diff_enabled() and wrist_online:
         diff_cfg = get_wrist_diff_config()
         for enc_key, motor_key in (("pitch_encoder_index", "pitch_encoder_motor_id"),
                                    ("roll_encoder_index", "roll_encoder_motor_id")):
@@ -683,36 +880,111 @@ def apply_robot_config_to_arm():
             motor_id = diff_cfg.get(motor_key)
             try:
                 if enc_idx is not None:
-                    send_command(f"ENCMAP {int(enc_idx)} 0")
-                    time.sleep(0.01)
-                    send_command(f"ENCMAP {int(enc_idx)} {int(motor_id)}")
-                    time.sleep(0.02)
+                    motor_i = int(motor_id)
+                    enc_i = int(enc_idx)
+                    controller_name = _controller_for_motor(motor_i)
+                    desired_enc_map_by_controller.setdefault(controller_name, {})[enc_i] = motor_i
             except Exception:
                 pass
+    elif wrist_diff_enabled() and not wrist_online:
+        print("Wrist differential is enabled but wrist controller is offline; skipping wrist ENCMAP overrides.")
+
+    # Always reset all encoder slots so stale mappings from a previous power cycle
+    # cannot survive reconnect and break ABSPID bring-up.
+    for enc_idx in range(8):
+        if not all_required_controllers_healthy(require_fresh=False):
+            print("Config apply aborted: controller dropped during ENCMAP reset.")
+            return False
+        send_command(f"ENCMAP {enc_idx} 0")
+        time.sleep(0.01)
+
+    for controller_name in sorted(desired_enc_map_by_controller.keys()):
+        per_ctrl_map = desired_enc_map_by_controller.get(controller_name, {})
+        for enc_idx in sorted(per_ctrl_map.keys()):
+            if not all_required_controllers_healthy(require_fresh=False):
+                print("Config apply aborted: controller dropped during ENCMAP apply.")
+                return False
+            send_command(f"ENCMAP {enc_idx} {per_ctrl_map[enc_idx]}")
+            time.sleep(0.02)
 
     for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
         cfg = robot_config.get(str(mid), {})
         enc_idx = cfg.get("abs_encoder_index")
-        if enc_idx is not None:
-            try:
-                send_command(f"ENCMAP {int(enc_idx)} {int(mid)}")
-                time.sleep(0.02)
-            except Exception:
-                pass
+        if enc_idx is None:
+            continue
+        try:
+            enc_i = int(enc_idx)
+            rev_i = 1 if bool(cfg.get("abs_encoder_reversed", True)) else 0
+            send_command(f"ENCREVSET {enc_i} {rev_i} {int(mid)}")
+            time.sleep(0.02)
+        except Exception:
+            pass
+
+    # Firmware marks abs encoders as "detected" asynchronously in updateAbsEncoders().
+    # Give that loop a short settle window after remapping before enabling ABSPID.
+    time.sleep(0.20)
+
+    abspid_packets = []
+    wrist_joint_set = set(wrist_diff_joint_ids()) if wrist_diff_enabled() else set()
+    skipped_abs_pid = []
+    for mid in sorted(robot_config.keys(), key=lambda x: int(x)):
+        if not all_required_controllers_healthy(require_fresh=False):
+            print("Config apply aborted: controller dropped during ABSPID apply.")
+            return False
+        cfg = robot_config.get(str(mid), {})
         enable = 1 if bool(cfg.get("abs_pid_enabled", False)) else 0
-        if wrist_diff_enabled() and int(mid) in set(wrist_diff_joint_ids()):
+        if cfg.get("abs_encoder_index") is None:
+            if enable == 1:
+                skipped_abs_pid.append(int(mid))
             enable = 0
+        if wrist_diff_enabled() and wrist_online and int(mid) in wrist_joint_set:
+            enable = 0
+        abspid_packets.append((int(mid), int(enable)))
         send_command(f"ABSPID {mid} {enable}")
         time.sleep(0.02)
 
+    # Retry enabled ABSPID after remap/detection settle to handle
+    # "ABSPID skipped: encoder not detected yet" timing races on reconnect.
+    for _ in range(3):
+        time.sleep(0.10)
+        for mid, enable in abspid_packets:
+            if not all_required_controllers_healthy(require_fresh=False):
+                print("Config apply aborted: controller dropped during ABSPID retry.")
+                return False
+            if enable == 1:
+                send_command(f"ABSPID {mid} 1")
+                time.sleep(0.01)
+
+    if skipped_abs_pid:
+        print(
+            "ABSPID disabled for unmapped motors: "
+            + ", ".join(f"M{m}" for m in sorted(set(skipped_abs_pid)))
+        )
+
+    if not all_required_controllers_healthy(require_fresh=False):
+        print("Config apply failed: required controller offline at completion.")
+        return False
     print("Applied robot_config.json settings to arm controller.")
     return True
 
 
 def save_robot_config():
     try:
+        existing = {}
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        existing = loaded
+            except Exception:
+                existing = {}
+        payload = dict(existing)
+        payload["controllers"] = _normalize_controller_config(controller_config)
+        payload["motors"] = robot_config
+        payload["wrist_differential"] = wrist_diff_config
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"motors": robot_config, "wrist_differential": wrist_diff_config}, f, indent=2)
+            json.dump(payload, f, indent=2)
     except Exception as e:
         print(f"Warning: Failed to save {CONFIG_FILE}: {e}")
 
@@ -754,7 +1026,7 @@ def update_wrist_diff_controller_once():
     global wrist_diff_last_update_time, wrist_diff_last_motor_cmd
     if not wrist_diff_enabled():
         return False
-    if not (ser and ser.is_open):
+    if not is_serial_connected():
         return False
     pitch_target = wrist_diff_target_logical_deg.get("pitch")
     roll_target = wrist_diff_target_logical_deg.get("roll")
@@ -833,8 +1105,10 @@ def wrist_diff_control_loop():
             time.sleep(0.05)
 
 
-def sync_solver_seed_from_telemetry(update_target=False):
+def sync_solver_seed_from_telemetry(update_target=False, require_all_controllers=True):
     global current_joint_angles, actual_joint_angles, current_target_xyz
+    if require_all_controllers and not all_required_controllers_healthy(require_fresh=True):
+        return False
     tele_angles = get_current_real_joint_angles()
     if tele_angles is None:
         return False
@@ -1001,9 +1275,11 @@ def _connect_single_controller(controller_name, port_name):
         tx.start()
     return conn
 
-def connect_serial():
-    global wrist_diff_thread, last_command_wall_time
+def connect_serial(perform_startup_actions=True):
+    global wrist_diff_thread, last_command_wall_time, expected_controller_names
     if _connected_controller_count() > 0:
+        if not expected_controller_names:
+            expected_controller_names = set(_connected_controller_names())
         _sync_legacy_serial_refs()
         update_connection_button()
         return True
@@ -1018,24 +1294,27 @@ def connect_serial():
         for controller_name, port_name in assignments:
             print(f"Connecting {controller_name} controller to {port_name}...")
             _connect_single_controller(controller_name, port_name)
+        expected_controller_names = {name for name, _ in assignments}
         _sync_legacy_serial_refs()
         print(f"Connected controllers: {', '.join(f'{name}={controller_ports[name]}' for name, _ in assignments)}")
 
         latest_motor_pos_deg.clear()
         latest_motor_apos_deg.clear()
         latest_motor_telemetry_time.clear()
+        reset_runtime_motion_state()
         if wrist_diff_thread is None or not wrist_diff_thread.is_alive():
             wrist_diff_thread = threading.Thread(target=wrist_diff_control_loop, daemon=True)
             wrist_diff_thread.start()
 
-        send_command("S; TON")
-        load_robot_config()
-        print("Loaded robot_config.json for IK limits/offset mapping.")
-        apply_robot_config_to_arm()
-        time.sleep(0.25)
-        sync_solver_seed_from_telemetry(update_target=True)
-        move_configured_joints_to_zero_on_connect()
-        last_command_wall_time = time.time()
+        if perform_startup_actions:
+            send_command("S; TON")
+            load_robot_config()
+            print("Loaded robot_config.json for IK limits/offset mapping.")
+            apply_robot_config_to_arm()
+            time.sleep(0.25)
+            sync_solver_seed_from_telemetry(update_target=True)
+            move_configured_joints_to_zero_on_connect()
+            last_command_wall_time = time.time()
         print("Serial connected and telemetry enabled.")
         update_connection_button()
         return True
@@ -1046,7 +1325,7 @@ def connect_serial():
         return False
 
 def disconnect_serial():
-    global ser, read_thread, tx_thread, last_telemetry_line, hand_pwm_command
+    global ser, read_thread, tx_thread, last_telemetry_line, hand_pwm_command, expected_controller_names
     clear_wrist_diff_targets(send_stop=True)
     send_command("HSTOP")
     hand_pwm_command = 0
@@ -1064,7 +1343,9 @@ def disconnect_serial():
     latest_motor_pos_deg.clear()
     latest_motor_apos_deg.clear()
     latest_motor_telemetry_time.clear()
-    _clear_pending_commands()
+    clear_abspid_skip_state()
+    reset_runtime_motion_state()
+    expected_controller_names = set()
     ser = None
     read_thread = None
     tx_thread = None
@@ -1237,6 +1518,8 @@ def read_from_port(controller_name):
     motor_re = re.compile(r"M(\d+)")
     pos_re = re.compile(r"POS:([^\s|]+)")
     apos_re = re.compile(r"APOS:([^\s|]+)")
+    abspid_skip_re = re.compile(r"M(\d+)\s+ABSPID skipped:\s*(.+)")
+    abspid_abs_ok_re = re.compile(r"M(\d+)\s+PID source:\s*ABS\b")
     conn = controller_serial.get(controller_name)
     while conn and conn.is_open:
         try:
@@ -1246,6 +1529,25 @@ def read_from_port(controller_name):
                     controller_last_telemetry_line[controller_name] = line
                     last_telemetry_line = line
                     print(f"[{controller_name}] {line}")
+
+                    skip_match = abspid_skip_re.search(line)
+                    if skip_match:
+                        try:
+                            motor_id = int(skip_match.group(1))
+                            reason = skip_match.group(2).strip()
+                            abspid_skip_state[motor_id] = reason
+                        except Exception:
+                            pass
+
+                    abs_ok_match = abspid_abs_ok_re.search(line)
+                    if abs_ok_match:
+                        try:
+                            motor_id = int(abs_ok_match.group(1))
+                            if motor_id in abspid_skip_state:
+                                del abspid_skip_state[motor_id]
+                        except Exception:
+                            pass
+
                     for token in line.split("|"):
                         token = token.strip()
                         if not token.startswith("M"):
@@ -1257,6 +1559,8 @@ def read_from_port(controller_name):
                             continue
                         try:
                             mid = int(mm.group(1))
+                            if not _controller_owns_motor(controller_name, mid):
+                                continue
                             now = time.time()
                             if pm:
                                 pv = _safe_float(pm.group(1))
@@ -1272,8 +1576,10 @@ def read_from_port(controller_name):
             time.sleep(0.01)
         except (serial.SerialException, OSError) as e:
             print(f"Serial read error ({controller_name}): {e}")
+            _handle_controller_disconnect(controller_name, reason="read error")
             break
         except Exception:
+            _handle_controller_disconnect(controller_name, reason="reader exception")
             break
 
 def _is_motion_command(cmd):
@@ -1299,6 +1605,7 @@ def command_tx_loop(controller_name):
                 time.sleep(0.015)
         except Exception as e:
             print(f"Error sending command ({controller_name}): {e}")
+            _handle_controller_disconnect(controller_name, reason="write error")
         finally:
             controller_cmd_queues[controller_name].task_done()
 
@@ -1874,6 +2181,7 @@ def set_current_pose_as_motor_and_ik_zero(event):
         if apos_now is not None:
             cfg["abs_zero_offset"] = float(apos_now)
         cfg["zero_offset"] = 0.0
+        cfg["ik_zero_offset"] = 0.0
         cal_cmds.append(f"CAL {mid} 0")
         updated.append(mid)
 
@@ -1890,13 +2198,18 @@ def set_current_pose_as_motor_and_ik_zero(event):
     render_plot()
 
 def emergency_stop_callback(event):
-    global hand_pwm_command
+    global hand_pwm_command, live_update
     print("EMERGENCY STOP TRIGGERED!")
+    live_update = False
     for mid in last_sent_logical_deg:
         last_sent_logical_deg[mid] = None
+    clear_wrist_diff_targets(send_stop=False)
+    _clear_pending_commands()
     hand_pwm_command = 0
-    send_command("S")
-    send_command("HSTOP")
+    for send_idx in range(3):
+        send_command("S; HSTOP")
+        if send_idx < 2:
+            time.sleep(0.03)
 
 
 def hand_open_button_callback(event):

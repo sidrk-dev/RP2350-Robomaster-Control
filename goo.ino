@@ -323,10 +323,11 @@ void printHelp() {
   Serial.println("  HAND <-255..255>    : Signed hand PWM (+open, -close)");
   Serial.println("  ENCZERO <enc>       : Set encoder zero point");
   Serial.println("  ENCREV <enc>        : Toggle encoder direction");
+  Serial.println("  ENCREVSET <enc> <0|1> [motor] : Set encoder direction (0=normal, 1=reversed)");
   Serial.println("  BLINK               : Blink onboard LED for 5 seconds");
   Serial.println("");
   Serial.println("S : Stop ALL motors");
-  Serial.println("H : Help");
+  Serial.println("H : Help ASK ZAC FOR HELP");
 }
 
 void handleSerial() {
@@ -1354,6 +1355,42 @@ void processCommand(String line) {
     Serial.print("Encoder ");
     Serial.print(encIdx);
     Serial.print(" direction: ");
+    Serial.println(absEncoderReversed[encIdx] ? "REVERSED" : "NORMAL");
+    return;
+  }
+
+  // Command: ENCODER REVERSE SET -> "ENCREVSET <enc_idx> <0|1>"
+  if (line.startsWith("ENCREVSET ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 == -1 || sp2 == -1) {
+      Serial.println("Error: Use format 'ENCREVSET <enc_idx> <0|1> [motor_id]'");
+      return;
+    }
+    int encIdx = line.substring(sp1 + 1, sp2).toInt();
+    int sp3 = line.indexOf(' ', sp2 + 1);
+    String reversedStr = (sp3 == -1) ? line.substring(sp2 + 1) : line.substring(sp2 + 1, sp3);
+    int reversed = reversedStr.toInt();
+    if (encIdx < 0 || encIdx >= NUM_ENCODERS) {
+      Serial.print("Error: Encoder index must be 0-");
+      Serial.println(NUM_ENCODERS - 1);
+      return;
+    }
+    if (!(reversed == 0 || reversed == 1)) {
+      Serial.println("Error: ENCREVSET value must be 0 or 1");
+      return;
+    }
+    absEncoderReversed[encIdx] = (reversed == 1);
+    int8_t mIdx = absEncoderMotorMap[encIdx];
+    if (mIdx >= 0 && mIdx < MOTOR_NUM) {
+      fallbackMotorToInternalEncoder(mIdx);
+      resetAbsStateForMotor(mIdx);
+      encoderDetected[encIdx] = false;
+      encoderRetryCount[encIdx] = 0;
+    }
+    Serial.print("Encoder ");
+    Serial.print(encIdx);
+    Serial.print(" direction set: ");
     Serial.println(absEncoderReversed[encIdx] ? "REVERSED" : "NORMAL");
     return;
   }

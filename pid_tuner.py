@@ -390,12 +390,34 @@ class MotorTab:
             return
 
         self.send_cmd(f"ENCMAP {enc_i} {mid}")
+        rev_i = 1 if bool(self.config.get("abs_encoder_reversed", True)) else 0
+        self.send_cmd(f"ENCREVSET {enc_i} {rev_i} {mid}")
 
     def apply_abs_pid(self):
         self.on_change()
         mid = int(self.motor_id)
         enable = 1 if bool(self.config.get("abs_pid_enabled", False)) else 0
+        enc_idx = self.config.get("abs_encoder_index")
+        if enable == 1 and enc_idx is None:
+            self.send_cmd(f"ABSPID {mid} 0")
+            return
+        if enc_idx is not None:
+            try:
+                enc_i = int(enc_idx)
+                rev_i = 1 if bool(self.config.get("abs_encoder_reversed", True)) else 0
+                self.send_cmd(f"ENCMAP {enc_i} {mid}")
+                time.sleep(0.02)
+                self.send_cmd(f"ENCREVSET {enc_i} {rev_i} {mid}")
+                # Firmware marks abs encoders as detected asynchronously.
+                # Let mapping/detection settle before enabling ABSPID.
+                time.sleep(0.20)
+            except Exception:
+                pass
         self.send_cmd(f"ABSPID {mid} {enable}")
+        if enable == 1:
+            for _ in range(3):
+                time.sleep(0.10)
+                self.send_cmd(f"ABSPID {mid} 1")
 
     def apply_angle_pid(self):
         kp = self.var_kp.get()
@@ -457,6 +479,14 @@ class MotorTab:
             f"; SKP {mid} {skp:.4f}; SKI {mid} {ski:.4f}; SKD {mid} {skd:.4f}; SOL {mid} {sol:.2f}"
         )
         self.send_cmd(batch)
+        enc_idx = self.config.get("abs_encoder_index")
+        if enc_idx is not None:
+            try:
+                enc_i = int(enc_idx)
+                rev_i = 1 if bool(self.config.get("abs_encoder_reversed", True)) else 0
+                self.send_cmd(f"ENCREVSET {enc_i} {rev_i} {int(mid)}")
+            except Exception:
+                pass
 
     def test_move(self, angle):
         angle = float(angle)
@@ -473,8 +503,22 @@ class MotorTab:
         self._set_target_display(angle)
 
     def jog(self, delta):
-        """Jog motor by delta degrees using relative PR command."""
-        self.send_cmd(f"PR {self.motor_id} {delta}")
+        """Jog motor by delta degrees using a bounded absolute target."""
+        try:
+            delta_f = float(delta)
+        except Exception:
+            return
+
+        reference = self._gauge_current_deg
+        if reference is None:
+            reference = self.target_deg
+        if reference is None:
+            messagebox.showwarning("Jog Unavailable", "No telemetry yet for this motor. Wait for live POS telemetry, then jog.")
+            return
+
+        target = self._project_target_to_limits(float(reference) + delta_f, reference=reference)
+        self.send_cmd(f"P {self.motor_id} {target:.3f}")
+        self._set_target_display(target, reference=reference)
 
     def jog_custom(self):
         try:
@@ -482,7 +526,7 @@ class MotorTab:
         except ValueError:
             messagebox.showerror("Error", "Invalid relative delta value")
             return
-        self.send_cmd(f"PR {self.motor_id} {delta}")
+        self.jog(delta)
 
     def set_zero(self):
         self.send_cmd(f"CAL {self.motor_id} 0")
@@ -1296,8 +1340,16 @@ class PIDTunerApp:
     def _connected_controller_names(self):
         return [name for name, conn in self.controller_serial.items() if conn and conn.is_open]
 
+    def _is_any_controller_connected(self):
+        return bool(self._connected_controller_names())
+
     def _sync_legacy_serial_ref(self):
-        self.ser = self.controller_serial.get("base") or self.controller_serial.get("joint4") or self.controller_serial.get("wrist")
+        for name in ("base", "joint4", "wrist"):
+            conn = self.controller_serial.get(name)
+            if conn and conn.is_open:
+                self.ser = conn
+                return
+        self.ser = None
 
     def _controller_has_fresh_telemetry(self, controller_name):
         cfg = self.controller_map.get(controller_name, {}) if isinstance(self.controller_map.get(controller_name, {}), dict) else {}
@@ -1362,6 +1414,10 @@ class PIDTunerApp:
             return {"base", "joint4", "wrist"}
         if op in {"P", "PR", "M", "MV", "KP", "KI", "KD", "AOL", "SKP", "SKI", "SKD", "SOL", "ABSPID", "CAL", "JLIM", "GEAR"} and len(toks) >= 2:
             return {self._controller_for_motor(toks[1])}
+        if op == "ENCREVSET":
+            if len(toks) >= 4:
+                return {self._controller_for_motor(toks[3])}
+            return {"base", "joint4", "wrist"}
         if op == "ENCMAP":
             if len(toks) >= 3 and toks[2] != "0":
                 return {self._controller_for_motor(toks[2])}
@@ -2035,7 +2091,7 @@ class PIDTunerApp:
         self.log_box.config(state="disabled")
 
     def apply_all(self):
-        if not self.ser or not self.ser.is_open:
+        if not self._is_any_controller_connected():
             messagebox.showwarning("Not Connected", "Please connect to the arm first to apply settings alive.")
             return
 
@@ -2076,7 +2132,24 @@ class PIDTunerApp:
         # and wrist controller is actually connected).
         self.apply_wrist_settings(show_status=False)
 
+        for mid, tab in self.tabs.items():
+            enc_idx = tab.config.get("abs_encoder_index")
+            if enc_idx is None:
+                continue
+            try:
+                enc_i = int(enc_idx)
+                rev_i = 1 if bool(tab.config.get("abs_encoder_reversed", True)) else 0
+                self.send_command(f"ENCREVSET {enc_i} {rev_i} {int(mid)}")
+                time.sleep(0.02)
+            except Exception:
+                continue
+
+        # Firmware detects mapped abs encoders asynchronously in its background
+        # update loop. Allow a brief settle window before ABSPID enable.
+        time.sleep(0.20)
+
         skipped_abs_pid = []
+        abspid_packets = []
         for mid, tab in self.tabs.items():
             enable = 1 if bool(tab.config.get("abs_pid_enabled", False)) else 0
             if tab.config.get("abs_encoder_index") is None:
@@ -2088,8 +2161,18 @@ class PIDTunerApp:
                 str(int(self.config["wrist_differential"].get("roll_joint_id", 6)))
             }:
                 enable = 0
+            abspid_packets.append((int(mid), int(enable)))
             self.send_command(f"ABSPID {mid} {enable}")
             time.sleep(0.02)
+
+        # Retry ABSPID enables to survive transient "encoder not detected yet"
+        # windows right after ENCMAP updates.
+        for _ in range(3):
+            time.sleep(0.10)
+            for mid, enable in abspid_packets:
+                if enable == 1:
+                    self.send_command(f"ABSPID {mid} 1")
+                    time.sleep(0.01)
 
         if skipped_abs_pid:
             self.status_bar.config(
@@ -2102,12 +2185,12 @@ class PIDTunerApp:
             self.status_bar.config(text="Applied ALL settings: gear, limits, PID, ENCMAP, ABSPID, telemetry ON.")
 
     def apply_encoder_mappings(self, show_status=True):
-        if not self.ser or not self.ser.is_open:
+        if not self._is_any_controller_connected():
             if show_status:
                 messagebox.showwarning("Not Connected", "Please connect to the arm first.")
             return
 
-        desired_by_enc = {}
+        desired_by_controller = {"base": {}, "joint4": {}, "wrist": {}}
         duplicates = []
         for mid, tab in self.tabs.items():
             tab.on_change()
@@ -2115,49 +2198,39 @@ class PIDTunerApp:
             if enc_idx is None:
                 continue
             try:
+                mid_i = int(mid)
                 enc_i = int(enc_idx)
             except Exception:
                 continue
-            if enc_i in desired_by_enc and desired_by_enc[enc_i] != int(mid):
-                duplicates.append(enc_i)
-            desired_by_enc[enc_i] = int(mid)
+            controller_name = self._controller_for_motor(mid_i)
+            per_ctrl = desired_by_controller.setdefault(controller_name, {})
+            if enc_i in per_ctrl and per_ctrl[enc_i] != mid_i:
+                duplicates.append((controller_name, enc_i))
+            per_ctrl[enc_i] = mid_i
 
         if duplicates and show_status:
-            messagebox.showwarning("Encoder Mapping", f"Multiple motors selected the same encoder index: {sorted(set(duplicates))}. Last one wins.")
+            dup_text = ", ".join(f"{ctrl}:E{enc}" for ctrl, enc in sorted(set(duplicates)))
+            messagebox.showwarning("Encoder Mapping", f"Conflicting encoder index on the same controller ({dup_text}). Last one wins per controller.")
 
-        max_encoder_index = -1
-        for tab in self.tabs.values():
-            enc_idx = tab.config.get("abs_encoder_index")
-            if enc_idx is None:
-                continue
-            try:
-                max_encoder_index = max(max_encoder_index, int(enc_idx))
-            except Exception:
-                continue
-        encoder_slots = max(2, max_encoder_index + 1)
-
-        for e in range(encoder_slots):
+        # Always clear all firmware encoder slots so stale mappings from prior
+        # sessions/power cycles cannot survive.
+        for e in range(8):
             self.send_command(f"ENCMAP {e} 0")
             time.sleep(0.01)
 
-        for mid, tab in self.tabs.items():
-            enc_idx = tab.config.get("abs_encoder_index")
-            if enc_idx is None:
-                continue
-            try:
-                enc_i = int(enc_idx)
-            except Exception:
-                continue
-            self.send_command(f"ENCMAP {enc_i} {int(mid)}")
-            time.sleep(0.02)
+        for controller_name in ("base", "joint4", "wrist"):
+            per_ctrl = desired_by_controller.get(controller_name, {})
+            for enc_i in sorted(per_ctrl.keys()):
+                self.send_command(f"ENCMAP {enc_i} {int(per_ctrl[enc_i])}")
+                time.sleep(0.02)
 
         if show_status:
-            self.status_bar.config(text="Applied absolute encoder mappings to arm.")
+            self.status_bar.config(text="Applied absolute encoder mappings per controller.")
 
     def apply_wrist_settings(self, show_status=True):
         if hasattr(self, "wrist_tuning_tab"):
             self.wrist_tuning_tab.on_change()
-        if not self.ser or not self.ser.is_open:
+        if not self._is_any_controller_connected():
             if show_status:
                 messagebox.showwarning("Not Connected", "Please connect to the arm first.")
             return
@@ -2198,7 +2271,7 @@ class PIDTunerApp:
         self.status_bar.config(text=f"Loaded '{preset_name}' preset into all motor tabs. Review, then Apply.")
 
     def apply_limits_all(self):
-        if not self.ser or not self.ser.is_open:
+        if not self._is_any_controller_connected():
             messagebox.showwarning("Not Connected", "Please connect to the arm first.")
             return
         for mid, tab in self.tabs.items():
@@ -2211,7 +2284,7 @@ class PIDTunerApp:
         self.status_bar.config(text="Applied all joint limits to arm.")
 
     def safe_bringup(self):
-        if not self.ser or not self.ser.is_open:
+        if not self._is_any_controller_connected():
             messagebox.showwarning("Not Connected", "Please connect to the arm first.")
             return
         self.send_command("S; TON")

@@ -581,7 +581,12 @@ class DashboardWindow(QMainWindow):
         self._last_telemetry_text = ""
         self._last_table_values = {}
         self._last_telemetry_live = False
+        self._last_controller_state_snapshot = None
         self._last_auto_apply_time = 0.0
+        self._last_runtime_apply_ok = False
+        self._motion_armed = False
+        self._motion_block_reason = "awaiting first verify"
+        self._motion_block_logged = False
         self.keymap = self._load_keymap()
         self.keymap_inputs = {}
         self.key_indicator_labels = {}
@@ -590,6 +595,51 @@ class DashboardWindow(QMainWindow):
         self._start_timers()
         self.refresh_all()
         self.setFocusPolicy(Qt.StrongFocus)
+
+    def _backend_connected(self):
+        return bool(getattr(backend, "is_serial_connected", lambda: False)())
+
+    def _controller_runtime_state_snapshot(self):
+        now = time.time()
+        stale_sec = float(getattr(backend, "TELEMETRY_STALE_SEC", 1.0))
+
+        groups = getattr(backend, "CONTROLLER_MOTOR_GROUPS", {}) or {}
+        cfg = getattr(backend, "controller_config", {})
+        if isinstance(cfg, dict) and cfg:
+            mapped_groups = {}
+            for name, default_motors in groups.items():
+                cfg_entry = cfg.get(name, {}) if isinstance(cfg.get(name, {}), dict) else {}
+                raw_motors = cfg_entry.get("motors", list(default_motors))
+                parsed = set()
+                if isinstance(raw_motors, list):
+                    for mid in raw_motors:
+                        try:
+                            parsed.add(int(mid))
+                        except Exception:
+                            pass
+                mapped_groups[name] = parsed if parsed else set(default_motors)
+            groups = mapped_groups
+
+        serial_map = getattr(backend, "controller_serial", {}) or {}
+        tele_map = getattr(backend, "latest_motor_telemetry_time", {}) or {}
+
+        states = []
+        for name in sorted(groups.keys()):
+            conn = serial_map.get(name)
+            connected = bool(conn and getattr(conn, "is_open", False))
+            fresh = False
+            for mid in groups.get(name, set()):
+                ts = tele_map.get(int(mid))
+                if ts is None:
+                    continue
+                try:
+                    if (now - float(ts)) <= stale_sec:
+                        fresh = True
+                        break
+                except Exception:
+                    continue
+            states.append((name, connected, fresh))
+        return tuple(states)
 
     def _init_backend(self):
         backend.load_robot_config()
@@ -607,12 +657,10 @@ class DashboardWindow(QMainWindow):
             backend.apply_chain_bounds_from_config()
             if not self._connect_serial_passive():
                 self._append_log("Serial connection not established at startup.")
-            if not backend.sync_solver_seed_from_telemetry(update_target=True):
+            elif not backend.sync_solver_seed_from_telemetry(update_target=True):
                 backend.refresh_locked_joint_rads(backend.current_joint_angles)
                 backend.apply_chain_bounds_from_config()
                 backend.sync_target_from_joint_angles(backend.current_joint_angles)
-            else:
-                self._append_log("Synchronized dashboard pose from telemetry.")
             backend.planar_target_y = float(backend.current_target_xyz[1])
         except Exception as exc:
             traceback.print_exc()
@@ -711,6 +759,10 @@ class DashboardWindow(QMainWindow):
         self.joint_speed_input.valueChanged.connect(lambda _: self._apply_joint_speed_setting(log_change=True))
         controls_layout.addWidget(QLabel("Joint Speed (deg/s)"), 7, 0)
         controls_layout.addWidget(self.joint_speed_input, 7, 1)
+
+        self.btn_verify_apply = QPushButton("Post-Reconnect Verify + Arm Motion")
+        self.btn_verify_apply.clicked.connect(self.log_runtime_apply_plan)
+        controls_layout.addWidget(self.btn_verify_apply, 8, 0, 1, 2)
 
         status_group = QGroupBox("Link Status")
         status_layout = QVBoxLayout(status_group)
@@ -978,23 +1030,19 @@ class DashboardWindow(QMainWindow):
         self.refresh_all(skip_inputs=True, draw_canvas=False)
 
     def _connect_serial_passive(self):
-        was_connected = bool(backend.ser and backend.ser.is_open)
-        old_auto_zero = getattr(backend, "AUTO_MOVE_TO_ZERO_ON_CONNECT", True)
-        try:
-            backend.AUTO_MOVE_TO_ZERO_ON_CONNECT = False
-            ok = backend.connect_serial()
-        finally:
-            backend.AUTO_MOVE_TO_ZERO_ON_CONNECT = old_auto_zero
+        was_connected = self._backend_connected()
+        ok = backend.connect_serial(perform_startup_actions=False)
         if not ok:
             return False
+        backend.send_command("S; TON")
+        self._engage_motion_safety_lock("serial connect")
         if backend.wait_for_telemetry(timeout_sec=1.5):
             self._append_log("Connected serial device; telemetry is live.")
         else:
             self._append_log("Connected serial device; waiting for telemetry.")
-        if was_connected:
-            self._apply_runtime_config_bundle("manual reconnect")
-        else:
-            self._last_auto_apply_time = time.time()
+        reason = "manual reconnect" if was_connected else "startup connect"
+        self._apply_runtime_config_bundle(reason)
+        self._last_auto_apply_time = time.time()
         self._last_telemetry_live = bool(backend.has_fresh_telemetry())
         return True
 
@@ -1003,14 +1051,139 @@ class DashboardWindow(QMainWindow):
             backend.send_command("S; TON")
             backend.load_robot_config()
             applied = backend.apply_robot_config_to_arm()
+            self._last_runtime_apply_ok = bool(applied)
             if applied:
                 self._append_log(f"Auto-applied config/ENCMAP/ABSPID after {reason}.")
+                backend.wait_for_telemetry(timeout_sec=1.5)
+                if backend.sync_solver_seed_from_telemetry(update_target=True, require_all_controllers=False):
+                    self._append_log("Synchronized dashboard pose from telemetry.")
+                else:
+                    all_ctrl_ok = bool(getattr(backend, "all_required_controllers_healthy", lambda require_fresh=True: False)(True))
+                    if not all_ctrl_ok:
+                        self._append_log("Pose sync blocked: required controller telemetry is missing/stale.")
+                    else:
+                        self._append_log("Pose sync from telemetry not ready after auto-apply.")
             else:
-                self._append_log(f"Auto-apply skipped after {reason} (missing serial/config).")
+                self._append_log(f"Auto-apply failed after {reason}; motion stays locked.")
+                self._engage_motion_safety_lock("runtime apply failed")
             return applied
         except Exception as exc:
+            self._last_runtime_apply_ok = False
             self._append_log(f"Auto-apply failed after {reason}: {exc}")
+            self._engage_motion_safety_lock("runtime apply exception")
             return False
+
+    def _engage_motion_safety_lock(self, reason):
+        self._motion_armed = False
+        self._motion_block_reason = str(reason)
+        self._motion_block_logged = False
+        reset_motion = getattr(backend, "reset_runtime_motion_state", None)
+        if callable(reset_motion):
+            reset_motion()
+        if bool(getattr(backend, "live_update", False)):
+            backend.live_update = False
+            if hasattr(self, "chk_live"):
+                self.chk_live.blockSignals(True)
+                self.chk_live.setChecked(False)
+                self.chk_live.blockSignals(False)
+        self._append_log(
+            f"Motion lock engaged ({reason}). Run 'Post-Reconnect Verify + Arm Motion' before Execute/Live motion."
+        )
+
+    def _is_motion_allowed(self):
+        if not self._last_runtime_apply_ok:
+            if not self._motion_block_logged:
+                self._append_log("Motion blocked: runtime config apply is not confirmed. Reconnect and verify.")
+                self._motion_block_logged = True
+            return False
+        all_ctrl_ok = bool(getattr(backend, "all_required_controllers_healthy", lambda require_fresh=True: False)(False))
+        if not all_ctrl_ok:
+            if not self._motion_block_logged:
+                self._append_log("Motion blocked: one or more required controllers are offline.")
+                self._motion_block_logged = True
+            return False
+        if not self._backend_connected() or not bool(getattr(backend, "has_fresh_telemetry", lambda: False)()):
+            if not self._motion_block_logged:
+                self._append_log("Motion blocked: telemetry is not live. Reconnect and run 'Post-Reconnect Verify + Arm Motion'.")
+                self._motion_block_logged = True
+            return False
+        if self._motion_armed:
+            return True
+        if not self._motion_block_logged:
+            self._append_log(
+                f"Motion blocked: {self._motion_block_reason}. Click 'Post-Reconnect Verify + Arm Motion'."
+            )
+            self._motion_block_logged = True
+        return False
+
+    def log_runtime_apply_plan(self):
+        try:
+            if not self._last_runtime_apply_ok:
+                self._append_log("Verify blocked: runtime apply not confirmed. Reconnect to retry auto-apply.")
+                self._engage_motion_safety_lock("runtime apply not confirmed")
+                return
+            backend.load_robot_config()
+            planner = getattr(backend, "get_expected_runtime_apply_plan", None)
+            if planner is None:
+                self._append_log("Runtime verify unavailable: backend planner not found.")
+                return
+            plan = planner() or {}
+            connected = plan.get("connected_controllers", [])
+            self._append_log(
+                "Verify plan: connected controllers = "
+                + (", ".join(connected) if connected else "none")
+            )
+            self._append_log(
+                f"Verify plan: wrist diff enabled={bool(plan.get('wrist_diff_enabled', False))}, "
+                f"wrist online={bool(plan.get('wrist_online', False))}."
+            )
+
+            enc_map_by_controller = plan.get("enc_map_by_controller", {}) or {}
+            for controller_name in sorted(enc_map_by_controller.keys()):
+                mapping = enc_map_by_controller.get(controller_name, {}) or {}
+                if mapping:
+                    mapped_text = ", ".join(
+                        f"E{int(enc)}->M{int(mid)}" for enc, mid in sorted(mapping.items(), key=lambda item: int(item[0]))
+                    )
+                else:
+                    mapped_text = "(no ENCMAP assignments)"
+                self._append_log(f"Verify ENCMAP[{controller_name}]: {mapped_text}")
+
+            abspid_map = plan.get("abspid_enable_by_motor", {}) or {}
+            abspid_text = ", ".join(
+                f"M{int(mid)}={int(enable)}" for mid, enable in sorted(abspid_map.items(), key=lambda item: int(item[0]))
+            ) if abspid_map else "(none)"
+            self._append_log(f"Verify ABSPID: {abspid_text}")
+
+            skipped = plan.get("abspid_skipped_unmapped", []) or []
+            if skipped:
+                self._append_log(
+                    "Verify note: ABSPID disabled for unmapped motors: "
+                    + ", ".join(f"M{int(mid)}" for mid in skipped)
+                )
+
+            skip_state_getter = getattr(backend, "get_abspid_skip_state", None)
+            runtime_skips = skip_state_getter() if callable(skip_state_getter) else {}
+            if runtime_skips:
+                details = ", ".join(
+                    f"M{int(mid)} ({reason})" for mid, reason in sorted(runtime_skips.items(), key=lambda item: int(item[0]))
+                )
+                self._append_log("Verify failed: firmware reported ABSPID skips: " + details)
+                self._append_log("Motion remains locked. Re-run apply/verify after encoder detection is stable.")
+                return
+
+            if not backend.sync_solver_seed_from_telemetry(update_target=True, require_all_controllers=False):
+                self._append_log("Verify warning: telemetry sync unavailable; motion remains locked.")
+                return
+
+            backend.actual_joint_angles = list(backend.current_joint_angles)
+            backend.refresh_locked_joint_rads(backend.actual_joint_angles)
+            self._motion_armed = True
+            self._motion_block_reason = ""
+            self._motion_block_logged = False
+            self._append_log("Verify complete: motion armed using current telemetry pose.")
+        except Exception as exc:
+            self._append_log(f"Runtime verify failed: {exc}")
 
     def _start_timers(self):
         self.refresh_timer = QTimer(self)
@@ -1044,6 +1217,8 @@ class DashboardWindow(QMainWindow):
             self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _send_current_joint_target(self, smooth=False, repeat_count=1):
+        if not self._is_motion_allowed():
+            return False
         self._apply_joint_speed_setting(log_change=False)
         backend.current_joint_angles = backend.clamp_seed_angles_to_bounds(
             backend.enforce_locked_joints(backend.current_joint_angles)
@@ -1058,22 +1233,21 @@ class DashboardWindow(QMainWindow):
             repeat_count=repeat_count,
         )
         backend.last_send_time = time.time()
+        return True
 
     def toggle_connection(self):
-        if backend.ser and backend.ser.is_open:
+        if self._backend_connected():
             backend.disconnect_serial()
+            self._last_runtime_apply_ok = False
             self._append_log("Disconnected serial device.")
         else:
             ok = self._connect_serial_passive()
             self._append_log("Serial connection failed." if not ok else "Passive startup complete: no motion commands sent.")
-            if ok:
-                if backend.sync_solver_seed_from_telemetry(update_target=True):
-                    self._append_log("Synchronized dashboard pose from telemetry.")
         self.refresh_all()
 
     def execute_now(self):
-        self._send_current_joint_target(smooth=True, repeat_count=1)
-        self._append_log("Execute requested.")
+        sent = self._send_current_joint_target(smooth=True, repeat_count=1)
+        self._append_log("Execute sent." if sent else "Execute blocked (see motion lock/status log).")
         self.refresh_all()
 
     def preview_plan(self):
@@ -1086,6 +1260,9 @@ class DashboardWindow(QMainWindow):
         self.refresh_all()
 
     def estop(self):
+        self._pressed_keys.clear()
+        self._key_action_fired.clear()
+        self._engage_motion_safety_lock("manual E-Stop")
         backend.emergency_stop_callback(None)
         self._append_log("Emergency stop sent.")
         self.refresh_all()
@@ -1156,7 +1333,7 @@ class DashboardWindow(QMainWindow):
         self.refresh_all(skip_inputs=True)
 
     def sync_target_from_telemetry(self):
-        if backend.sync_solver_seed_from_telemetry(update_target=True):
+        if backend.sync_solver_seed_from_telemetry(update_target=True, require_all_controllers=False):
             self._append_log("Target synchronized from telemetry pose.")
         else:
             self._append_log("Target sync from telemetry skipped: no telemetry.")
@@ -1377,6 +1554,8 @@ class DashboardWindow(QMainWindow):
 
     def _live_execute_tick(self):
         if backend.live_update:
+            if not self._is_motion_allowed():
+                return
             now = time.time()
             if now - backend.last_send_time > 0.1:
                 self._send_current_joint_target(smooth=False, repeat_count=1)
@@ -1405,12 +1584,33 @@ class DashboardWindow(QMainWindow):
                     if f"joint_{joint_idx}" not in self._editing_inputs and joint_idx < len(backend.current_joint_angles):
                         self.joint_inputs[joint_idx].setValue(float(np.degrees(backend.current_joint_angles[joint_idx])))
 
-            connected = bool(backend.ser and backend.ser.is_open)
+            connected = self._backend_connected()
             telemetry_live = bool(connected and backend.has_fresh_telemetry())
-            if telemetry_live and not self._last_telemetry_live:
+            controller_state = self._controller_runtime_state_snapshot()
+            controller_recovered = False
+            controller_degraded = False
+            if self._last_controller_state_snapshot is not None:
+                prev_map = {
+                    name: (prev_connected, prev_fresh)
+                    for name, prev_connected, prev_fresh in self._last_controller_state_snapshot
+                }
+                for name, is_connected, is_fresh in controller_state:
+                    prev_connected, prev_fresh = prev_map.get(name, (False, False))
+                    if is_connected and not prev_connected:
+                        controller_recovered = True
+                    if prev_connected and not is_connected:
+                        controller_degraded = True
+            self._last_controller_state_snapshot = controller_state
+
+            if controller_degraded:
+                self._engage_motion_safety_lock("controller degraded")
+
+            if (telemetry_live and not self._last_telemetry_live) or controller_recovered:
                 now = time.time()
                 if (now - self._last_auto_apply_time) >= 2.0:
-                    self._apply_runtime_config_bundle("telemetry reconnect")
+                    reason = "controller recovery" if controller_recovered else "telemetry reconnect"
+                    self._engage_motion_safety_lock(reason)
+                    self._apply_runtime_config_bundle(reason)
                     self._last_auto_apply_time = now
             self._last_telemetry_live = telemetry_live
 
@@ -1536,7 +1736,7 @@ class DashboardWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if backend.ser and backend.ser.is_open:
+            if self._backend_connected():
                 backend.disconnect_serial()
         finally:
             super().closeEvent(event)
