@@ -143,6 +143,52 @@ pip install ikpy pyserial matplotlib numpy scipy pynput
 - **`keyboard_control.py`**: Hold `W` to spin RoboMaster Motor 1 forward, `S` to spin backward. `Q` to quit.
 - **`differential_wrist_control.py`**: Uses WASD to control a differential wrist attached to Motors 1 and 2. `W/S` for Pitch, `A/D` for Roll.
 - **`cytron_control.py`**: Hold `U` to spin the Cytron motor forward (PWM 255), `J` to spin backward. `Q` to quit.
+- **`multi_motor_keyboard_control.py`**: Multi-controller keyboard velocity tool that reads controller ports from `robot_config.json`, opens all configured COM ports, and routes per-motor `M <id> <rpm>` commands with remappable keys.
+
+## Multi-Motor Keyboard Controller (`multi_motor_keyboard_control.py`)
+
+### Purpose
+- Connects to all controller ports defined under `controllers` in `robot_config.json`.
+- Routes velocity commands to the correct board based on motor assignment.
+- Lets you hold/release remappable keys to command motor RPM live.
+
+### Run
+```bash
+python multi_motor_keyboard_control.py
+```
+
+Optional arguments:
+```bash
+python multi_motor_keyboard_control.py --config robot_config.json --keymap multi_motor_keymap.json --baud 115200
+```
+
+### On startup
+- If keymap file does not exist, the script creates `multi_motor_keymap.json` with defaults.
+- It verifies every configured controller port is present before opening.
+- It prints full usage instructions and all runtime key bindings.
+
+### Key behavior
+- Press/hold mapped **forward** key -> sends positive RPM for that motor.
+- Press/hold mapped **reverse** key -> sends negative RPM for that motor.
+- Release key -> sends `M <id> 0` for that motor.
+- **Stop-All** key sends `S` to all connected controllers.
+- **Quit** key exits and sends stop before closing ports.
+
+### Remapping keys
+Edit `multi_motor_keymap.json` and restart the script.
+
+Schema:
+```json
+{
+  "quit": "esc",
+  "stop_all": "space",
+  "blink": "b",
+  "motors": {
+    "1": { "forward": "1", "reverse": "q", "speed": 50 },
+    "2": { "forward": "2", "reverse": "w", "speed": 50 }
+  }
+}
+```
 
 ## Recommended Daily Workflow (Important)
 

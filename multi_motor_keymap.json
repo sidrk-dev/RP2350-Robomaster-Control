@@ -1,0 +1,37 @@
+{
+  "quit": "esc",
+  "stop_all": "space",
+  "blink": "b",
+  "motors": {
+    "1": {
+      "forward": "1",
+      "reverse": "q",
+      "speed": 50
+    },
+    "2": {
+      "forward": "2",
+      "reverse": "w",
+      "speed": 50
+    },
+    "3": {
+      "forward": "3",
+      "reverse": "e",
+      "speed": 50
+    },
+    "4": {
+      "forward": "4",
+      "reverse": "r",
+      "speed": 50
+    },
+    "5": {
+      "forward": "5",
+      "reverse": "t",
+      "speed": 50
+    },
+    "6": {
+      "forward": "6",
+      "reverse": "y",
+      "speed": 50
+    }
+  }
+}
