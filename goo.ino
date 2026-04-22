@@ -8,17 +8,19 @@
 // 10:1 gear ratio for the differential wrist
 
 // -------------------- CONFIGURATION --------------------
-/*#define RX_PIN 4  // gpio4 (MISO)
-#define CS_PIN 5  // gpio5 (CS)x
-#define SCK_PIN 6 // gpio6 (SCK)
-#define TX_PIN 7  // gpio7 (MOSI)*/
 
-#define RX_PIN 4  // D9  / GPIO4 (SPI0_MISO)
+/*#define RX_PIN 4  // D9  / GPIO4 (SPI0_MISO)
 #define CS_PIN 1  // D7  / GPIO1 (SPI0_CSn)
 #define SCK_PIN 2 // D8  / GPIO2 (SPI0_SCK)
-#define TX_PIN 3  // D10 / GPIO3 (SPI0_MOSI)
+#define TX_PIN 3  // D10 / GPIO3 (SPI0_MOSI)*/
 #define HAND_DIR_PIN D5
 #define HAND_PWM_PIN D6
+
+// new test to switch to mobility code
+#define RX_PIN D9  // D9  / GPIO4 (SPI0_MISO)
+#define CS_PIN D3  // D7  / GPIO1 (SPI0_CSn)
+#define SCK_PIN D8 // D8  / GPIO2 (SPI0_SCK)
+#define TX_PIN D10 // D10 / GPIO3 (SPI0_MOSI)
 
 // -------------------- ABSOLUTE ENCODER (AMT203S on SPI1) --------------------
 #define ENC_SCK_PIN D0  // GPIO26 -> SPI1 SCK
@@ -30,7 +32,7 @@
 #define ENC_SET_ZERO 0x70
 #define ENC_TIMEOUT 100
 
-const uint8_t ENC_CS_PINS[] = {D3, D4};
+const uint8_t ENC_CS_PINS[] = {D4};
 const uint8_t NUM_ENCODERS = sizeof(ENC_CS_PINS) / sizeof(ENC_CS_PINS[0]);
 
 #define M2006_GEAR_RATIO 36.0
@@ -323,7 +325,8 @@ void printHelp() {
   Serial.println("  HAND <-255..255>    : Signed hand PWM (+open, -close)");
   Serial.println("  ENCZERO <enc>       : Set encoder zero point");
   Serial.println("  ENCREV <enc>        : Toggle encoder direction");
-  Serial.println("  ENCREVSET <enc> <0|1> [motor] : Set encoder direction (0=normal, 1=reversed)");
+  Serial.println("  ENCREVSET <enc> <0|1> [motor] : Set encoder direction "
+                 "(0=normal, 1=reversed)");
   Serial.println("  BLINK               : Blink onboard LED for 5 seconds");
   Serial.println("");
   Serial.println("S : Stop ALL motors");
@@ -418,7 +421,8 @@ static float projectLogicalTargetToLimits(uint8_t motorIndex, float targetDeg,
   if (isJointFullRange(motorIndex)) {
     return nearestEquivalent(targetDeg, referenceDeg);
   }
-  referenceDeg = clampf(referenceDeg, jointMin[motorIndex], jointMax[motorIndex]);
+  referenceDeg =
+      clampf(referenceDeg, jointMin[motorIndex], jointMax[motorIndex]);
   if (targetDeg >= jointMin[motorIndex] && targetDeg <= jointMax[motorIndex]) {
     return targetDeg;
   }
@@ -449,7 +453,8 @@ static void fallbackMotorToInternalEncoder(uint8_t motorIndex) {
   float previousLogical = getControlLogicalAngle(motorIndex);
   float previousTargetLogical =
       motor[motorIndex].target.angle - zeroAtControlTotal[motorIndex];
-  zeroAtControlTotal[motorIndex] = motor[motorIndex].totalAngle - previousLogical;
+  zeroAtControlTotal[motorIndex] =
+      motor[motorIndex].totalAngle - previousLogical;
   motor[motorIndex].useAbsEncoderForPID = false;
   if (motor[motorIndex].mode == MODE::ANGLE) {
     motor[motorIndex].target.angle =
@@ -1239,7 +1244,8 @@ void processCommand(String line) {
     int endM = isWild ? MOTOR_NUM - 1 : singleId - 1;
     for (int i = startM; i <= endM; i++) {
       float previousLogical = getControlLogicalAngle(i);
-      float previousTargetLogical = motor[i].target.angle - zeroAtControlTotal[i];
+      float previousTargetLogical =
+          motor[i].target.angle - zeroAtControlTotal[i];
 
       if (enable == 1) {
         int8_t encIdx = findMappedEncoderForMotor(i);
@@ -1364,12 +1370,14 @@ void processCommand(String line) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
     if (sp1 == -1 || sp2 == -1) {
-      Serial.println("Error: Use format 'ENCREVSET <enc_idx> <0|1> [motor_id]'");
+      Serial.println(
+          "Error: Use format 'ENCREVSET <enc_idx> <0|1> [motor_id]'");
       return;
     }
     int encIdx = line.substring(sp1 + 1, sp2).toInt();
     int sp3 = line.indexOf(' ', sp2 + 1);
-    String reversedStr = (sp3 == -1) ? line.substring(sp2 + 1) : line.substring(sp2 + 1, sp3);
+    String reversedStr =
+        (sp3 == -1) ? line.substring(sp2 + 1) : line.substring(sp2 + 1, sp3);
     int reversed = reversedStr.toInt();
     if (encIdx < 0 || encIdx >= NUM_ENCODERS) {
       Serial.print("Error: Encoder index must be 0-");
